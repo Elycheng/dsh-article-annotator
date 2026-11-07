@@ -31,6 +31,8 @@
 
 ### 从 npm（推荐）
 
+> 首次公开发布前 npm 上还没有这个包；在此之前请用下面的「从本地源码」方式安装。
+
 ```sh
 dsh plugin --profile web add dsh-article-annotator
 ```
