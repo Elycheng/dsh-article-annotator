@@ -1,10 +1,10 @@
 /**
- * Test entry: run the whole offline suite in one process.
+ * Test entry: run the whole offline suite.
  *
- * `node --test` normally spawns a child per file; the DSH sandbox used during
- * development cannot open the pipes that needs, so the files are enumerated
- * here and handed to a single non-isolated runner. Running from a normal
- * terminal (no sandbox) works the same way.
+ * The files are enumerated here (instead of a shell glob) so the runner works
+ * on Windows PowerShell, POSIX shells and CI alike. On Node versions that
+ * support `--test-isolation=none` the suite runs in one process; older Node 20
+ * releases do not know that flag, so the standard per-file runner is used.
  */
 import { readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -17,7 +17,11 @@ const files = readdirSync(HERE)
   .sort()
   .map((name) => join(HERE, name))
 
-console.log('running ' + files.length + ' test files:')
+const [major, minor] = process.versions.node.split('.').map((part) => Number(part))
+const supportsIsolation = major > 22 || (major === 22 && minor >= 8)
+
+console.log('running ' + files.length + ' test files (node ' + process.versions.node + '):')
 for (const file of files) console.log('  - ' + file.slice(HERE.length + 1))
-const result = spawnSync(process.execPath, ['--test', '--test-isolation=none', ...files], { stdio: 'inherit' })
+const args = supportsIsolation ? ['--test', '--test-isolation=none', ...files] : ['--test', ...files]
+const result = spawnSync(process.execPath, args, { stdio: 'inherit' })
 process.exit(result.status ?? 1)
