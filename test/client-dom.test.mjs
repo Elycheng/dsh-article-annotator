@@ -80,6 +80,18 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
   globalThis.Node = window.Node
   globalThis.MutationObserver = window.MutationObserver
   globalThis.getComputedStyle = window.getComputedStyle.bind(window)
+  // Node 20/22 have no global navigator; React's scheduler reads it. Node 24
+  // exposes a read-only getter, so define the property when possible and fall
+  // back to assignment on older runtimes.
+  try {
+    Object.defineProperty(globalThis, 'navigator', { value: window.navigator, configurable: true, writable: true })
+  } catch {
+    try {
+      globalThis.navigator = window.navigator
+    } catch {
+      // A readonly navigator already exists; nothing to do.
+    }
+  }
   globalThis.IS_REACT_ACT_ENVIRONMENT = true
   // react-dom reads `window`/`document` when it is first imported, so the
   // modules are required only after the jsdom globals exist.
