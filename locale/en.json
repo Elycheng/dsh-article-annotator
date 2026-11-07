@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Article Review",
+    "description": "Sentence-level comments on Markdown / Word / PowerPoint / PDF articles in the right sidebar; the agent reads every comment through tools, revises the article, resolves comments, and records recurring wording preferences into a long-term style memory."
+  }
+}

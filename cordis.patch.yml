@@ -1,0 +1,14 @@
+# Bundle layer for dsh-article-annotator.
+#
+# Selected as a profile bundle (`dsh plugin --profile <name> add link:<path>`)
+# this row is inserted by the plugin manager. The same row may be appended to
+# the profile's own cordis.patch.yml for a manual install.
+- insert:
+    - id: article-annotator
+      name: dsh-article-annotator
+      config:
+        injectStyle: true
+        maxStyleRules: 12
+        maxArticleBytes: 41943040
+        maxBlocks: 1500
+        enableTools: true

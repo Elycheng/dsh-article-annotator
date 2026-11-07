@@ -1,0 +1,7 @@
+# Normalize line endings: source stays LF on every platform.
+* text=auto eol=lf
+
+# Keep fixtures / generated binaries untouched.
+*.png binary
+*.ico binary
+*.tgz binary

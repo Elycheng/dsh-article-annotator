@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "jsx": "react",
+    "strict": true,
+    "noImplicitAny": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmitOnError": true,
+    "sourceMap": false,
+    "declaration": false,
+    "outDir": "lib/.client-build",
+    "rootDir": "src/client",
+    "types": []
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx"]
+}

@@ -1,0 +1,1325 @@
+/**
+ * dsh-article-annotator — browser half.
+ *
+ * Registered as a page type in DSH's native right sidebar (`sidebarRightTabs`)
+ * with its body in the keyed `sidebar.right.pane.tab` seat, exactly the way
+ * dsh-client-ui-quote's quote list is registered on this host version.
+ *
+ * The tab shows one article as sentence-addressable text:
+ *
+ *   - Markdown / TXT / DOCX / PPTX / PDF are extracted by the host half into
+ *     blocks + sentences; this half renders them and turns every sentence into
+ *     an annotation anchor.
+ *   - A click on a sentence opens a small editor; saved comments are durable
+ *     (host side) and are re-anchored after the article is edited.
+ *   - "发给 Agent 修改" writes a compact review digest into the composer as a
+ *     draft (never sends); the agent then reads the comments through its
+ *     article_review / article_read tools, revises, resolves them and records
+ *     recurring wording preferences with writing_style_add.
+ *
+ * Only `react` is required at runtime (a frozen platform module); everything
+ * else in this bundle is plain DOM/CSS.
+ */
+import * as React from 'react'
+
+type CommentStatus = 'open' | 'resolved'
+
+interface Sentence {
+  id: string
+  index: number
+  text: string
+}
+
+interface Block {
+  id: string
+  kind: string
+  text: string
+  level?: number
+  page?: number
+  slide?: number
+  sentences: Sentence[]
+}
+
+interface CommentRow {
+  id: string
+  blockId: string
+  sentenceIndex: number
+  sentence: string
+  comment: string
+  status: CommentStatus
+  createdAt?: number
+  updatedAt?: number
+  agentReply?: string
+  orphaned?: boolean
+  blockKind?: string
+  page?: number
+  slide?: number
+}
+
+interface Article {
+  absolutePath: string
+  file: string
+  name: string
+  ext: string
+  format: string
+  title: string
+  blocks: Block[]
+  stats: { blocks: number; sentences: number; chars: number; bytes?: number }
+  warnings?: string[]
+}
+
+interface StyleRule {
+  id: string
+  rule: string
+  tags?: string[]
+  evidence?: string
+}
+
+interface FileItem {
+  path: string
+  absolutePath: string
+  name: string
+  ext: string
+  size: number
+  mtimeMs: number
+}
+
+interface RecentItem {
+  absolutePath: string
+  file: string
+  title?: string
+  format?: string
+  at?: number
+}
+
+interface EditorState {
+  blockId: string
+  sentenceIndex: number
+  sentence: string
+  blockKind: string
+  page?: number
+  slide?: number
+  commentId?: string
+  text: string
+  left: number
+  top: number
+}
+
+const TAB_ID = 'dsh-article-annotator/main'
+const TAB_KIND = 'article-annotator'
+const TAB_TITLE = '文稿批注'
+const API_BASE = '/article-annotator/api'
+
+let pluginCtx: any = null
+
+/* ------------------------------------------------------------------ *
+ * Small utilities
+ * ------------------------------------------------------------------ */
+
+function serviceOf(name: string): any {
+  const ctx = pluginCtx
+  if (ctx === null || ctx === undefined) return null
+  try {
+    const viaGet = typeof ctx.get === 'function' ? ctx.get(name) : undefined
+    if (viaGet !== undefined && viaGet !== null) return viaGet
+  } catch {
+    // fall through
+  }
+  try {
+    const value = ctx[name]
+    return value === undefined ? null : value
+  } catch {
+    return null
+  }
+}
+
+function clip(text: string, max: number): string {
+  const value = String(text ?? '')
+  if (value.length <= max) return value
+  return value.slice(0, Math.max(0, max - 1)) + '…'
+}
+
+function oneLine(text: string): string {
+  return String(text ?? '').replace(/\s+/gu, ' ').trim()
+}
+
+function formatLabel(format: string): string {
+  switch (format) {
+    case 'markdown':
+      return 'Markdown'
+    case 'text':
+      return '纯文本'
+    case 'docx':
+      return 'Word'
+    case 'pptx':
+      return 'PowerPoint'
+    case 'pdf':
+      return 'PDF'
+    default:
+      return String(format || '文稿')
+  }
+}
+
+function formatSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return ''
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+}
+
+function formatTime(ms?: number): string {
+  if (!Number.isFinite(ms) || ms === undefined || ms <= 0) return ''
+  try {
+    return new Date(ms).toLocaleString('zh-CN', { hour12: false })
+  } catch {
+    return ''
+  }
+}
+
+/** True when two adjacent sentence texts would merge without a space. */
+function needsSpaceBetween(left: string, right: string): boolean {
+  const a = left.slice(-1)
+  const b = right.slice(0, 1)
+  if (a === '' || b === '') return false
+  return /[A-Za-z0-9]/u.test(a) && /[A-Za-z0-9]/u.test(b)
+}
+
+function locationLabel(article: Article, blockId: string): string {
+  const index = article.blocks.findIndex((block) => block.id === blockId)
+  if (index < 0) return '原文位置不明'
+  const block = article.blocks[index]
+  const parts: string[] = []
+  if (block.page !== undefined) parts.push('第 ' + block.page + ' 页')
+  if (block.slide !== undefined) parts.push('第 ' + block.slide + ' 张幻灯片')
+  parts.push('第 ' + (index + 1) + ' 段')
+  if (block.kind === 'heading') parts.push('（标题）')
+  return parts.join(' · ')
+}
+
+async function api<T>(method: string, payload: any): Promise<T> {
+  let response: Response
+  try {
+    response = await fetch(API_BASE + '/' + method, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      credentials: 'same-origin',
+    })
+  } catch (error) {
+    throw new Error('批注服务连接失败：' + String((error as any)?.message ?? error))
+  }
+  let json: any = null
+  try {
+    json = await response.json()
+  } catch {
+    json = null
+  }
+  if (!response.ok || json === null || json.ok !== true) {
+    const code = json?.error?.code
+    if (code === 'unavailable') {
+      throw new Error('批注服务还没有在这个 DSH 进程里加载；安装或更新插件后需要重启一次 DSH。')
+    }
+    throw new Error(String(json?.error?.message ?? '请求失败（HTTP ' + response.status + '）'))
+  }
+  return json.value as T
+}
+
+/** Same-origin resource address for the native document preview. */
+export function fileAddressFor(sessionId: string, path: string): string | null {
+  if (typeof sessionId !== 'string' || sessionId === '' || typeof path !== 'string' || path === '') return null
+  const normalized = path.replace(/\\/gu, '/').replace(/^(?:\.\/)+/u, '')
+  const encode = (segment: string) => encodeURIComponent(segment).replace(/%3A/giu, ':')
+  return 'dsh-resource://file/session/' + encode(sessionId) + '/' + normalized.split('/').map(encode).join('/')
+}
+
+function openNativePreview(sessionId: string, file: string): boolean {
+  const service = serviceOf('sidebarRight')
+  if (service === null || typeof service.openResource !== 'function') return false
+  const address = fileAddressFor(sessionId, file)
+  if (address === null) return false
+  try {
+    service.openResource(address)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function inputShell(sessionId: string): any {
+  const ctx = pluginCtx
+  if (ctx === null || sessionId === '') return null
+  try {
+    const conversation = typeof ctx.get === 'function' ? ctx.get('conversation') : ctx.conversation
+    const hub = conversation?.input
+    if (hub === null || hub === undefined || typeof hub.shell !== 'function') return null
+    const shell = hub.shell(sessionId)
+    return shell === null || shell === undefined ? null : shell
+  } catch {
+    return null
+  }
+}
+
+function shellDraft(shell: any): string | null {
+  try {
+    const snapshot = shell?.state?.getSnapshot?.()
+    return typeof snapshot?.draft === 'string' ? snapshot.draft : null
+  } catch {
+    return null
+  }
+}
+
+/** Write text into a session composer (append after the reader's own words). */
+export function writeDraft(sessionId: string, text: string): boolean {
+  const shell = inputShell(sessionId)
+  if (shell === null) return false
+  const current = shellDraft(shell) ?? ''
+  const next = current.trim() === '' ? text : current.replace(/\s+$/u, '') + '\n\n' + text
+  try {
+    if (typeof shell.setDraft === 'function') {
+      shell.setDraft(next)
+      return true
+    }
+    const actions = shell.actions
+    if (actions !== null && actions !== undefined && typeof actions.setDraft === 'function') {
+      actions.setDraft(next)
+      return true
+    }
+  } catch (error) {
+    console.warn('[article-annotator] draft write refused:', error)
+  }
+  return false
+}
+
+export function copyText(text: string): boolean {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function') {
+      void navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // fall through
+  }
+  try {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    const ok = document.execCommand('copy')
+    area.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
+export function downloadText(filename: string, text: string): boolean {
+  try {
+    const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    return true
+  } catch {
+    return copyText(text)
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Review digest (composer message + Markdown export)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build the composer message the user sends after annotating.
+ * @param article - the reviewed article.
+ * @param openComments - comments still open.
+ * @param allComments - every comment (used for the header count).
+ */
+export function buildReviewMessage(article: Article, openComments: CommentRow[], allComments: CommentRow[]): string {
+  const lines: string[] = []
+  lines.push('【文稿批注 · 请按批注意见修改】' + article.file)
+  lines.push('（' + formatLabel(article.format) + '《' + article.title + '》；共 ' + allComments.length + ' 条批注，待处理 ' + openComments.length + ' 条）')
+  lines.push('')
+  openComments.forEach((row, index) => {
+    lines.push(index + 1 + '. ' + locationLabel(article, row.blockId) + '（批注 id: ' + row.id + '）')
+    lines.push('   原句：' + clip(oneLine(row.sentence), 160))
+    lines.push('   意见：' + oneLine(row.comment))
+  })
+  lines.push('')
+  lines.push('可用工具：article_review（读取批注与风格记忆）、article_read（读全文）、article_review_resolve（标记已解决）、article_review_save_revision（给 Word/PPT/PDF 写修订稿）、writing_style_add（记录新的表达风格规则）。')
+  if (article.format === 'markdown' || article.format === 'text') {
+    lines.push('这篇是文本文稿：请直接用编辑工具修改原文件，不要改文件名。')
+  } else {
+    lines.push('这篇是二进制文稿（' + formatLabel(article.format) + '）：不要把原文件当文本改；请用 article_review_save_revision 写出同名 .revised.md 修订稿。')
+  }
+  lines.push('完成后：① 用 article_review_resolve 把处理过的批注 id 标记为已解决；② 从这些批注归纳可复用的中文表达偏好，逐条用 writing_style_add 记录；③ 简要说明改了哪些句子。无法执行的批注保留待处理并说明原因。')
+  return lines.join('\n')
+}
+
+/** Markdown export of the review, for review records / hand-off. */
+export function buildExportMarkdown(article: Article, comments: CommentRow[]): string {
+  const open = comments.filter((row) => row.status === 'open')
+  const done = comments.filter((row) => row.status === 'resolved')
+  const lines: string[] = []
+  lines.push('# ' + article.title + ' · 批注')
+  lines.push('')
+  lines.push('- 文稿：' + article.file + '（' + formatLabel(article.format) + '）')
+  lines.push('- 导出时间：' + new Date().toLocaleString('zh-CN', { hour12: false }))
+  lines.push('- 统计：待处理 ' + open.length + ' 条 / 共 ' + comments.length + ' 条')
+  lines.push('')
+  const section = (title: string, rows: CommentRow[]) => {
+    lines.push('## ' + title + '（' + rows.length + ' 条）')
+    lines.push('')
+    if (rows.length === 0) {
+      lines.push('（无）')
+      lines.push('')
+      return
+    }
+    for (const row of rows) {
+      lines.push('- **' + locationLabel(article, row.blockId) + '**' + (row.orphaned === true ? '（定位失效）' : '') + ' · `' + row.id + '`')
+      lines.push('  - 原句：' + oneLine(row.sentence))
+      lines.push('  - 批注：' + oneLine(row.comment))
+      if (typeof row.agentReply === 'string' && row.agentReply !== '') lines.push('  - Agent：' + oneLine(row.agentReply))
+    }
+    lines.push('')
+  }
+  section('待处理', open)
+  section('已解决', done)
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ *
+ * Toast (module-level singleton element; the tab may unmount)
+ * ------------------------------------------------------------------ */
+
+let toastTimer: any
+function toast(message: string, kind: 'info' | 'warn' = 'info'): void {
+  if (typeof document === 'undefined') return
+  let element = document.getElementById('ar-toast')
+  if (element === null) {
+    element = document.createElement('div')
+    element.id = 'ar-toast'
+    element.className = 'ar-toast'
+    document.body.appendChild(element)
+  }
+  element.className = 'ar-toast' + (kind === 'warn' ? ' ar-toast-warn' : '')
+  element.textContent = message
+  element.setAttribute('data-show', '1')
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => {
+    element?.setAttribute('data-show', '0')
+  }, 3400)
+}
+
+/* ------------------------------------------------------------------ *
+ * Right-sidebar page registration
+ * ------------------------------------------------------------------ */
+
+function installStyleTag(): void {
+  if (typeof document === 'undefined') return
+  if (document.querySelector('style[data-plugin="dsh-article-annotator"]') !== null) return
+  const style = document.createElement('style')
+  style.dataset.plugin = 'dsh-article-annotator'
+  style.textContent = CSS_TEXT
+  document.head.appendChild(style)
+}
+
+function installTab(hostCtx: any): void {
+  try {
+    hostCtx.effect(
+      () => {
+        const disposers: Array<() => void> = []
+        const tabs = hostCtx.sidebarRightTabs
+        if (tabs !== null && tabs !== undefined && typeof tabs.register === 'function') {
+          try {
+            disposers.push(
+              tabs.register({
+                id: TAB_ID,
+                kind: TAB_KIND,
+                title: () => TAB_TITLE,
+                guide: [
+                  {
+                    id: 'article-annotator',
+                    commandId: 'article-annotator.open',
+                    order: 26,
+                    title: () => TAB_TITLE,
+                    description: () => '逐句批注 Markdown / Word / PowerPoint / PDF 文稿，交给 Agent 修改并沉淀写作风格',
+                  },
+                ],
+              }),
+            )
+          } catch (error) {
+            console.warn('[article-annotator] tab type registration refused:', error)
+          }
+        }
+        const slots = hostCtx.slots
+        if (slots !== null && slots !== undefined && typeof slots.inject === 'function') {
+          try {
+            disposers.push(
+              slots.inject('sidebar.right.pane.tab', () =>
+                slots.register(
+                  {
+                    name: 'sidebar.right.pane.tab',
+                    key: TAB_ID,
+                    inject: (sessionId: string) => ({ sessionId }),
+                  },
+                  ReviewBody,
+                ),
+              ),
+            )
+          } catch (error) {
+            console.warn('[article-annotator] tab body registration failed:', error)
+          }
+          try {
+            disposers.push(
+              slots.inject('sidebar.right.pane.tab.title', () =>
+                slots.register({ name: 'sidebar.right.pane.tab.title', key: TAB_ID }, () =>
+                  React.createElement('span', { className: 'ar-tab-title' }, TAB_TITLE),
+                ),
+              ),
+            )
+          } catch (error) {
+            console.warn('[article-annotator] tab title registration failed:', error)
+          }
+        }
+        return () => {
+          for (const dispose of disposers.reverse()) {
+            try {
+              dispose()
+            } catch {
+              // Best-effort teardown.
+            }
+          }
+        }
+      },
+      'article-annotator: right sidebar page',
+    )
+  } catch (error) {
+    console.warn('[article-annotator] tab install failed:', error)
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Main body
+ * ------------------------------------------------------------------ */
+
+function ReviewBody(props: any): any {
+  const sessionId: string = typeof props?.sessionId === 'string' ? props.sessionId : ''
+  const [booting, setBooting] = React.useState<boolean>(true)
+  const [busy, setBusy] = React.useState<boolean>(false)
+  const [error, setError] = React.useState<string>('')
+  const [notice, setNotice] = React.useState<string>('')
+  const [cwd, setCwd] = React.useState<string>('')
+  const [files, setFiles] = React.useState<FileItem[]>([])
+  const [recent, setRecent] = React.useState<RecentItem[]>([])
+  const [article, setArticle] = React.useState<Article | null>(null)
+  const [comments, setComments] = React.useState<CommentRow[]>([])
+  const [styleRules, setStyleRules] = React.useState<StyleRule[]>([])
+  const [pickerOpen, setPickerOpen] = React.useState<boolean>(false)
+  const [listOpen, setListOpen] = React.useState<boolean>(false)
+  const [styleOpen, setStyleOpen] = React.useState<boolean>(false)
+  const [filter, setFilter] = React.useState<'open' | 'all'>('open')
+  const [editor, setEditor] = React.useState<EditorState | null>(null)
+  const [saving, setSaving] = React.useState<boolean>(false)
+  const [deleteArmed, setDeleteArmed] = React.useState<boolean>(false)
+  const docRef = React.useRef<HTMLDivElement | null>(null)
+  const aliveRef = React.useRef<boolean>(true)
+  const sessionRef = React.useRef<string>(sessionId)
+  sessionRef.current = sessionId
+
+  React.useEffect(() => {
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+    }
+  }, [])
+
+  const openFile = React.useCallback(
+    async (file: string) => {
+      if (file === '') return
+      setBusy(true)
+      setError('')
+      try {
+        const value = await api<any>('open', { sessionId: sessionRef.current, file })
+        if (!aliveRef.current) return
+        setArticle(value.article)
+        setComments(Array.isArray(value.comments) ? value.comments : [])
+        setStyleRules(Array.isArray(value.styleRules) ? value.styleRules : [])
+        setCwd(typeof value.cwd === 'string' ? value.cwd : '')
+        setEditor(null)
+        setPickerOpen(false)
+        const bits: string[] = []
+        if (value.reanchored > 0) bits.push(value.reanchored + ' 条批注已按修改后的原文重新定位')
+        if (value.orphaned > 0) bits.push(value.orphaned + ' 条批注因原文改动暂时失去定位')
+        const warnings = Array.isArray(value.article?.warnings) ? value.article.warnings : []
+        const message = [...bits, ...warnings].join('；')
+        if (message !== '') setNotice(message)
+        else setNotice('')
+      } catch (failure) {
+        if (!aliveRef.current) return
+        setError(String((failure as any)?.message ?? failure))
+      } finally {
+        if (aliveRef.current) setBusy(false)
+      }
+    },
+    [],
+  )
+
+  const loadList = React.useCallback(
+    async (autoOpenRecent: boolean) => {
+      if (sessionId === '') {
+        setBooting(false)
+        return
+      }
+      setBooting(true)
+      setError('')
+      try {
+        const value = await api<any>('list', { sessionId })
+        if (!aliveRef.current) return
+        setCwd(typeof value.cwd === 'string' ? value.cwd : '')
+        const items: FileItem[] = Array.isArray(value.items) ? value.items : []
+        setFiles(items)
+        const recentItems: RecentItem[] = Array.isArray(value.recent) ? value.recent : []
+        setRecent(recentItems)
+        if (autoOpenRecent && recentItems.length > 0) {
+          const first = recentItems[0]
+          const known = items.find((item) => item.absolutePath === first.absolutePath)
+          if (known !== undefined) {
+            await openFile(known.path)
+          } else {
+            await openFile(first.file ?? first.absolutePath)
+          }
+        }
+      } catch (failure) {
+        if (!aliveRef.current) return
+        setError(String((failure as any)?.message ?? failure))
+      } finally {
+        if (aliveRef.current) setBooting(false)
+      }
+    },
+    [sessionId, openFile],
+  )
+
+  React.useEffect(() => {
+    setArticle(null)
+    setComments([])
+    setStyleRules([])
+    setEditor(null)
+    setNotice('')
+    setFiles([])
+    setRecent([])
+    void loadList(true)
+  }, [sessionId, loadList])
+
+  const refreshArticle = React.useCallback(async () => {
+    if (article === null) return
+    await openFile(article.file)
+  }, [article, openFile])
+
+  const openEditorAt = React.useCallback(
+    (event: any, block: Block, sentence: Sentence) => {
+      const existing = comments.find((row) => row.blockId === block.id && row.sentenceIndex === sentence.index)
+      const rect = event?.currentTarget?.getBoundingClientRect?.()
+      const width = 340
+      const viewportWidth = typeof window === 'undefined' ? 800 : window.innerWidth
+      const viewportHeight = typeof window === 'undefined' ? 800 : window.innerHeight
+      const left = Math.min(Math.max(8, (rect?.left ?? 12)), Math.max(8, viewportWidth - width - 12))
+      const top = Math.min(Math.max(64, (rect?.bottom ?? 120) + 6), Math.max(64, viewportHeight - 250))
+      setEditor({
+        blockId: block.id,
+        sentenceIndex: sentence.index,
+        sentence: sentence.text,
+        blockKind: block.kind,
+        page: block.page,
+        slide: block.slide,
+        commentId: existing?.id,
+        text: existing?.comment ?? '',
+        left,
+        top,
+      })
+      setDeleteArmed(false)
+    },
+    [comments],
+  )
+
+  const saveEditor = React.useCallback(async () => {
+    if (article === null || editor === null || saving) return
+    const text = editor.text.trim()
+    if (text === '') {
+      toast('批注内容不能为空', 'warn')
+      return
+    }
+    setSaving(true)
+    try {
+      const value = await api<any>('comment', {
+        sessionId: sessionRef.current,
+        file: article.file,
+        action: 'save',
+        ...(editor.commentId === undefined ? {} : { id: editor.commentId }),
+        blockId: editor.blockId,
+        sentenceIndex: editor.sentenceIndex,
+        sentence: editor.sentence,
+        comment: text,
+        blockKind: editor.blockKind,
+        ...(editor.page === undefined ? {} : { page: editor.page }),
+        ...(editor.slide === undefined ? {} : { slide: editor.slide }),
+      })
+      if (!aliveRef.current) return
+      const row: CommentRow = { ...value.comment, orphaned: false }
+      setComments((previous) => {
+        const index = previous.findIndex((item) => item.id === row.id)
+        if (index < 0) return [...previous, row]
+        const next = [...previous]
+        next[index] = row
+        return next
+      })
+      setEditor(null)
+      toast(editor.commentId === undefined ? '批注已保存' : '批注已更新')
+    } catch (failure) {
+      toast(String((failure as any)?.message ?? failure), 'warn')
+    } finally {
+      if (aliveRef.current) setSaving(false)
+    }
+  }, [article, editor, saving])
+
+  const deleteEditorComment = React.useCallback(async () => {
+    if (article === null || editor === null || editor.commentId === undefined) return
+    if (!deleteArmed) {
+      setDeleteArmed(true)
+      return
+    }
+    setSaving(true)
+    try {
+      await api<any>('comment', { sessionId: sessionRef.current, file: article.file, action: 'delete', id: editor.commentId })
+      if (!aliveRef.current) return
+      setComments((previous) => previous.filter((item) => item.id !== editor.commentId))
+      setEditor(null)
+      toast('批注已删除')
+    } catch (failure) {
+      toast(String((failure as any)?.message ?? failure), 'warn')
+    } finally {
+      if (aliveRef.current) setSaving(false)
+    }
+  }, [article, editor, deleteArmed])
+
+  const toggleStatus = React.useCallback(
+    async (row: CommentRow) => {
+      if (article === null) return
+      const status: CommentStatus = row.status === 'open' ? 'resolved' : 'open'
+      try {
+        await api<any>('comment', { sessionId: sessionRef.current, file: article.file, action: 'patch', id: row.id, status })
+        if (!aliveRef.current) return
+        setComments((previous) => previous.map((item) => (item.id === row.id ? { ...item, status } : item)))
+      } catch (failure) {
+        toast(String((failure as any)?.message ?? failure), 'warn')
+      }
+    },
+    [article],
+  )
+
+  const removeStyleRule = React.useCallback(async (id: string) => {
+    try {
+      const value = await api<any>('style', { action: 'remove', id })
+      if (!aliveRef.current) return
+      setStyleRules(Array.isArray(value.rules) ? value.rules : [])
+    } catch (failure) {
+      toast(String((failure as any)?.message ?? failure), 'warn')
+    }
+  }, [])
+
+  const jumpToComment = React.useCallback((row: CommentRow) => {
+    if (row.orphaned === true) {
+      toast('这句原文已经改动，无法定位', 'warn')
+      return
+    }
+    const sentenceId = row.blockId + 's' + row.sentenceIndex
+    const root = docRef.current
+    if (root === null || typeof root.querySelector !== 'function') return
+    const element = root.querySelector('[data-ar-sentence="' + sentenceId + '"]') as HTMLElement | null
+    if (element === null) {
+      toast('这句不在当前视图中（可能已被删除）', 'warn')
+      return
+    }
+    try {
+      element.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    } catch {
+      element.scrollIntoView()
+    }
+    element.classList.add('ar-s-flash')
+    setTimeout(() => {
+      try {
+        element.classList.remove('ar-s-flash')
+      } catch {
+        // Element may be gone.
+      }
+    }, 1200)
+  }, [])
+
+  const sendToAgent = React.useCallback(() => {
+    if (article === null) return
+    const openRows = comments.filter((row) => row.status === 'open')
+    if (openRows.length === 0) {
+      toast('没有待处理的批注', 'warn')
+      return
+    }
+    const message = buildReviewMessage(article, openRows, comments)
+    if (writeDraft(sessionRef.current, message)) {
+      toast('批注已写入输入框，检查后发送')
+    } else if (copyText(message)) {
+      toast('输入框不可用，批注已复制到剪贴板，粘贴后发送', 'warn')
+    } else {
+      toast('写入输入框失败，请重试', 'warn')
+    }
+  }, [article, comments])
+
+  const exportMarkdown = React.useCallback(() => {
+    if (article === null) return
+    const base = article.name.replace(/\.[^.]+$/u, '')
+    const ok = downloadText(base + '.批注.md', buildExportMarkdown(article, comments))
+    toast(ok ? '批注已导出' : '导出失败', ok ? 'info' : 'warn')
+  }, [article, comments])
+
+  const openNative = React.useCallback(() => {
+    if (article === null) return
+    if (openNativePreview(sessionRef.current, article.file)) toast('已在原生预览中打开')
+    else toast('打不开原生预览：当前宿主没有右侧栏文件导航', 'warn')
+  }, [article])
+
+  reactUseEditorEscape(editor, setEditor)
+
+  const openCount = comments.filter((row) => row.status === 'open').length
+  const resolvedCount = comments.length - openCount
+  const visibleComments = filter === 'open' ? comments.filter((row) => row.status === 'open') : comments
+
+  const commentBySentence = React.useMemo(() => {
+    const map = new Map<string, CommentRow>()
+    for (const row of comments) map.set(row.blockId + ':' + row.sentenceIndex, row)
+    return map
+  }, [comments])
+
+  const numberById = React.useMemo(() => {
+    const order: CommentRow[] = []
+    const seen = new Set<string>()
+    if (article !== null) {
+      for (const block of article.blocks) {
+        for (const sentence of block.sentences) {
+          const row = commentBySentence.get(block.id + ':' + sentence.index)
+          if (row !== undefined && !seen.has(row.id)) {
+            order.push(row)
+            seen.add(row.id)
+          }
+        }
+      }
+    }
+    for (const row of comments) {
+      if (!seen.has(row.id)) {
+        order.push(row)
+        seen.add(row.id)
+      }
+    }
+    const map = new Map<string, number>()
+    order.forEach((row, index) => map.set(row.id, index + 1))
+    return map
+  }, [article, comments, commentBySentence])
+
+  const renderSentence = (block: Block, sentence: Sentence, previous: Sentence | null) => {
+    const row = commentBySentence.get(block.id + ':' + sentence.index)
+    const number = row === undefined ? undefined : numberById.get(row.id)
+    const className = 'ar-s' + (row === undefined ? '' : ' ar-s-has') + (block.kind === 'code' ? ' ar-s-code' : '')
+    return React.createElement(
+      'span',
+      {
+        key: sentence.id,
+        className,
+        'data-ar-sentence': sentence.id,
+        'data-status': row === undefined ? undefined : row.status,
+        title: row === undefined ? '点击给这句写批注' : row.comment,
+        onClick: (event: any) => openEditorAt(event, block, sentence),
+      },
+      previous !== null && needsSpaceBetween(previous.text, sentence.text) ? ' ' : null,
+      sentence.text,
+      row === undefined ? null : React.createElement('sup', { className: 'ar-mark' }, String(number ?? '•')),
+    )
+  }
+
+  const renderBlock = (block: Block) => {
+    const children: any[] = []
+    block.sentences.forEach((sentence, index) => {
+      children.push(renderSentence(block, sentence, index === 0 ? null : block.sentences[index - 1]))
+      if (block.kind === 'code') children.push('\n')
+    })
+    if (block.kind === 'heading') {
+      return React.createElement('div', { key: block.id, className: 'ar-block ar-heading ar-h' + (block.level ?? 2) }, children)
+    }
+    if (block.kind === 'list') {
+      return React.createElement(
+        'div',
+        { key: block.id, className: 'ar-block ar-li' },
+        React.createElement('span', { className: 'ar-li-dot' }, '•'),
+        React.createElement('span', { className: 'ar-li-text' }, children),
+      )
+    }
+    if (block.kind === 'code') {
+      return React.createElement('pre', { key: block.id, className: 'ar-block ar-code' }, children)
+    }
+    if (block.kind === 'table') {
+      return React.createElement('div', { key: block.id, className: 'ar-block ar-table' }, children)
+    }
+    return React.createElement('p', { key: block.id, className: 'ar-block ar-p' }, children)
+  }
+
+  const renderDoc = () => {
+    if (article === null) return null
+    const nodes: any[] = []
+    let page: number | undefined
+    let slide: number | undefined
+    for (const block of article.blocks) {
+      if (block.page !== undefined && block.page !== page) {
+        page = block.page
+        nodes.push(React.createElement('div', { key: 'page-' + page, className: 'ar-divider' }, '第 ' + page + ' 页'))
+      }
+      if (block.slide !== undefined && block.slide !== slide) {
+        slide = block.slide
+        nodes.push(React.createElement('div', { key: 'slide-' + slide, className: 'ar-divider' }, '第 ' + slide + ' 张幻灯片'))
+      }
+      nodes.push(renderBlock(block))
+    }
+    return nodes
+  }
+
+  return React.createElement(
+    'div',
+    { className: 'ar-root' + (busy ? ' ar-busy' : '') },
+    // ── header ──────────────────────────────────────────────────────
+    React.createElement(
+      'div',
+      { className: 'ar-head' },
+      React.createElement(
+        'button',
+        {
+          className: 'ar-title-btn',
+          type: 'button',
+          title: article === null ? '选择一篇文稿' : article.absolutePath,
+          onClick: () => setPickerOpen(true),
+        },
+        React.createElement('span', { className: 'ar-title' }, article === null ? '选择一篇文稿' : article.title || article.name),
+        React.createElement('span', { className: 'ar-sub' }, article === null ? cwd || 'Markdown / Word / PowerPoint / PDF' : article.file + ' · ' + formatLabel(article.format)),
+      ),
+      React.createElement('button', { className: 'ar-btn', type: 'button', title: '刷新', onClick: () => void refreshArticle(), disabled: article === null || busy }, '刷新'),
+      React.createElement('button', { className: 'ar-btn', type: 'button', title: '在原生预览中打开', onClick: openNative, disabled: article === null }, '预览'),
+      React.createElement('button', { className: 'ar-btn' + (listOpen ? ' ar-btn-on' : ''), type: 'button', title: '批注列表', onClick: () => setListOpen(!listOpen) }, '批注 ' + openCount),
+      React.createElement('button', { className: 'ar-btn' + (styleOpen ? ' ar-btn-on' : ''), type: 'button', title: '写作风格记忆', onClick: () => setStyleOpen(true) }, '风格 ' + styleRules.length),
+    ),
+    // ── status bar ──────────────────────────────────────────────────
+    article === null
+      ? null
+      : React.createElement(
+          'div',
+          { className: 'ar-bar' },
+          React.createElement('span', { className: 'ar-stat' }, article.blocks.length + ' 段 · ' + article.stats.sentences + ' 句'),
+          React.createElement('span', { className: 'ar-stat' }, '待处理 ' + openCount),
+          React.createElement('span', { className: 'ar-stat' }, '已解决 ' + resolvedCount),
+          typeof article.stats.bytes === 'number' && article.stats.bytes > 0
+            ? React.createElement('span', { className: 'ar-stat' }, formatSize(article.stats.bytes))
+            : null,
+          React.createElement('span', { className: 'ar-spacer' }),
+          React.createElement(
+            'button',
+            { className: 'ar-btn ar-btn-primary', type: 'button', onClick: sendToAgent, disabled: openCount === 0 },
+            '发给 Agent 修改',
+          ),
+          React.createElement('button', { className: 'ar-btn', type: 'button', onClick: exportMarkdown }, '导出批注'),
+        ),
+    notice === '' ? null : React.createElement('div', { className: 'ar-notice' }, notice),
+    error === '' ? null : React.createElement('div', { className: 'ar-error' }, error, React.createElement('button', { className: 'ar-btn', type: 'button', onClick: () => void loadList(true) }, '重试')),
+    // ── body ────────────────────────────────────────────────────────
+    React.createElement(
+      'div',
+      { className: 'ar-main' },
+      booting
+        ? React.createElement('div', { className: 'ar-empty' }, '正在读取文稿列表…')
+        : article === null
+          ? React.createElement(
+              'div',
+              { className: 'ar-empty' },
+              React.createElement('div', { className: 'ar-empty-title' }, '给文稿逐句批注'),
+              React.createElement('div', { className: 'ar-empty-text' }, '选一篇 Markdown / Word / PowerPoint / PDF 文稿，点任意一句话写意见；写完点「发给 Agent 修改」，Agent 会读到每条意见、改稿、勾掉批注，并把反复出现的表达偏好记进写作风格记忆。'),
+              React.createElement('div', { className: 'ar-empty-actions' }, React.createElement('button', { className: 'ar-btn ar-btn-primary', type: 'button', onClick: () => setPickerOpen(true) }, '选择文稿')),
+              cwd === '' ? null : React.createElement('div', { className: 'ar-empty-path' }, '工作目录：' + cwd),
+            )
+          : listOpen
+            ? React.createElement(
+                'div',
+                { className: 'ar-list' },
+                React.createElement(
+                  'div',
+                  { className: 'ar-filters' },
+                  React.createElement('button', { className: 'ar-chip' + (filter === 'open' ? ' ar-chip-on' : ''), type: 'button', onClick: () => setFilter('open') }, '待处理 ' + openCount),
+                  React.createElement('button', { className: 'ar-chip' + (filter === 'all' ? ' ar-chip-on' : ''), type: 'button', onClick: () => setFilter('all') }, '全部 ' + comments.length),
+                ),
+                visibleComments.length === 0
+                  ? React.createElement('div', { className: 'ar-empty' }, filter === 'open' ? '没有待处理的批注' : '还没有批注')
+                  : visibleComments.map((row) =>
+                      React.createElement(
+                        'div',
+                        { key: row.id, className: 'ar-card' + (row.orphaned === true ? ' ar-card-orphan' : '') },
+                        React.createElement(
+                          'div',
+                          { className: 'ar-card-head' },
+                          React.createElement('span', { className: 'ar-card-loc' }, locationLabel(article, row.blockId)),
+                          React.createElement('span', { className: 'ar-status ar-status-' + row.status }, row.status === 'open' ? '待处理' : '已解决'),
+                          row.orphaned === true ? React.createElement('span', { className: 'ar-status ar-status-orphan' }, '定位失效') : null,
+                          React.createElement('span', { className: 'ar-spacer' }),
+                          React.createElement('button', { className: 'ar-mini', type: 'button', onClick: () => jumpToComment(row) }, '定位'),
+                          React.createElement('button', { className: 'ar-mini', type: 'button', onClick: () => void toggleStatus(row) }, row.status === 'open' ? '解决' : '重开'),
+                        ),
+                        React.createElement('div', { className: 'ar-card-quote' }, clip(oneLine(row.sentence), 160)),
+                        React.createElement('div', { className: 'ar-card-comment' }, row.comment),
+                        typeof row.agentReply === 'string' && row.agentReply !== '' ? React.createElement('div', { className: 'ar-card-reply' }, 'Agent：' + clip(oneLine(row.agentReply), 240)) : null,
+                      ),
+                    ),
+              )
+            : React.createElement('div', { className: 'ar-doc', ref: docRef }, renderDoc()),
+    ),
+    // ── overlays ────────────────────────────────────────────────────
+    pickerOpen ? React.createElement(FilePicker, { cwd, files, recent, onClose: () => setPickerOpen(false), onPick: (file: string) => void openFile(file) }) : null,
+    styleOpen
+      ? React.createElement(StylePanel, {
+          rules: styleRules,
+          onClose: () => setStyleOpen(false),
+          onRemove: (id: string) => void removeStyleRule(id),
+        })
+      : null,
+    editor === null
+      ? null
+      : React.createElement(
+          React.Fragment,
+          null,
+          React.createElement('div', { className: 'ar-pop-backdrop', onClick: () => setEditor(null) }),
+          React.createElement(
+            'div',
+            { className: 'ar-pop', style: { left: editor.left + 'px', top: editor.top + 'px' } },
+            React.createElement('div', { className: 'ar-pop-quote' }, clip(oneLine(editor.sentence), 200)),
+            React.createElement('textarea', {
+              className: 'ar-pop-input',
+              value: editor.text,
+              placeholder: '写对这句话的意见…',
+              rows: 4,
+              autoFocus: true,
+              onChange: (event: any) => setEditor({ ...editor, text: event.target.value }),
+              onKeyDown: (event: any) => {
+                if (event.key === 'Escape') setEditor(null)
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                  event.preventDefault()
+                  void saveEditor()
+                }
+              },
+            }),
+            React.createElement(
+              'div',
+              { className: 'ar-pop-actions' },
+              editor.commentId === undefined
+                ? null
+                : React.createElement('button', { className: 'ar-btn ar-btn-danger', type: 'button', onClick: () => void deleteEditorComment(), disabled: saving }, deleteArmed ? '确认删除' : '删除'),
+              React.createElement('span', { className: 'ar-spacer' }),
+              React.createElement('button', { className: 'ar-btn', type: 'button', onClick: () => setEditor(null) }, '取消'),
+              React.createElement('button', { className: 'ar-btn ar-btn-primary', type: 'button', onClick: () => void saveEditor(), disabled: saving }, saving ? '保存中…' : '保存'),
+            ),
+            React.createElement('div', { className: 'ar-pop-hint' }, '⌘/Ctrl + Enter 保存 · Esc 关闭'),
+          ),
+        ),
+  )
+}
+
+/** Esc closes the sentence editor while it is open. */
+function reactUseEditorEscape(editor: EditorState | null, setEditor: (value: EditorState | null) => void): void {
+  React.useEffect(() => {
+    if (editor === null || typeof window === 'undefined') return
+    const onKey = (event: any) => {
+      if (event.key === 'Escape') setEditor(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [editor, setEditor])
+}
+
+/* ------------------------------------------------------------------ *
+ * File picker / style panel
+ * ------------------------------------------------------------------ */
+
+function FilePicker(props: { cwd: string; files: FileItem[]; recent: RecentItem[]; onClose: () => void; onPick: (file: string) => void }): any {
+  const [query, setQuery] = React.useState<string>('')
+  const needle = query.trim().toLowerCase()
+  const matches = (item: FileItem) => needle === '' || item.path.toLowerCase().includes(needle) || item.name.toLowerCase().includes(needle)
+  const visible = props.files.filter(matches)
+  const recentItems = props.files.filter((item) => props.recent.some((entry) => entry.absolutePath === item.absolutePath))
+  const recentMatched = recentItems.filter(matches)
+  const others = visible.filter((item) => !recentItems.some((entry) => entry.absolutePath === item.absolutePath))
+  const recentOther = props.recent.filter((entry) => !props.files.some((item) => item.absolutePath === entry.absolutePath))
+  return React.createElement(
+    'div',
+    { className: 'ar-overlay', onClick: props.onClose },
+    React.createElement(
+      'div',
+      { className: 'ar-modal', onClick: (event: any) => event.stopPropagation() },
+      React.createElement('div', { className: 'ar-modal-head' }, React.createElement('span', { className: 'ar-modal-title' }, '选择文稿'), React.createElement('button', { className: 'ar-btn', type: 'button', onClick: props.onClose }, '关闭')),
+      React.createElement('div', { className: 'ar-modal-sub' }, props.cwd === '' ? '' : '工作目录：' + props.cwd),
+      React.createElement('input', { className: 'ar-search', value: query, placeholder: '搜索文件…', autoFocus: true, onChange: (event: any) => setQuery(event.target.value) }),
+      React.createElement(
+        'div',
+        { className: 'ar-file-list' },
+        needle !== '' && recentMatched.length > 0 ? React.createElement('div', { className: 'ar-file-group' }, '最近打开') : null,
+        needle !== '' ? recentMatched.map((item) => fileRow(item, props.onPick)) : null,
+        needle === '' && recentItems.length > 0 ? React.createElement('div', { className: 'ar-file-group' }, '最近打开') : null,
+        needle === '' ? recentItems.map((item) => fileRow(item, props.onPick)) : null,
+        needle === '' && others.length > 0 ? React.createElement('div', { className: 'ar-file-group' }, '工作目录中的文稿') : null,
+        (needle === '' ? others : visible.filter((item) => !recentItems.some((entry) => entry.absolutePath === item.absolutePath))).map((item) =>
+          fileRow(item, props.onPick),
+        ),
+        visible.length === 0
+          ? React.createElement('div', { className: 'ar-empty' }, props.files.length === 0 ? '这个工作目录里没有找到可批注的文稿（md / docx / pptx / pdf）' : '没有匹配的文件')
+          : null,
+        needle === '' && recentOther.length > 0 ? React.createElement('div', { className: 'ar-file-group' }, '最近打开（其他目录）') : null,
+        needle === '' ? recentOther.map((entry) => fileRowFromRecent(entry, props.onPick)) : null,
+      ),
+    ),
+  )
+}
+
+function fileRow(item: FileItem, onPick: (file: string) => void): any {
+  return React.createElement(
+    'button',
+    { key: item.absolutePath, className: 'ar-file-row', type: 'button', title: item.absolutePath, onClick: () => onPick(item.path) },
+    React.createElement('span', { className: 'ar-file-ext' }, item.ext.replace('.', '').toUpperCase()),
+    React.createElement('span', { className: 'ar-file-path' }, item.path),
+    React.createElement('span', { className: 'ar-file-meta' }, [formatSize(item.size), formatTime(item.mtimeMs)].filter(Boolean).join(' · ')),
+  )
+}
+
+function fileRowFromRecent(entry: RecentItem, onPick: (file: string) => void): any {
+  return React.createElement(
+    'button',
+    { key: entry.absolutePath, className: 'ar-file-row', type: 'button', title: entry.absolutePath, onClick: () => onPick(entry.file ?? entry.absolutePath) },
+    React.createElement('span', { className: 'ar-file-ext' }, String(entry.format ?? '').slice(0, 4).toUpperCase()),
+    React.createElement('span', { className: 'ar-file-path' }, entry.file),
+    React.createElement('span', { className: 'ar-file-meta' }, formatTime(entry.at)),
+  )
+}
+
+function StylePanel(props: { rules: StyleRule[]; onClose: () => void; onRemove: (id: string) => void }): any {
+  return React.createElement(
+    'div',
+    { className: 'ar-overlay', onClick: props.onClose },
+    React.createElement(
+      'div',
+      { className: 'ar-modal', onClick: (event: any) => event.stopPropagation() },
+      React.createElement('div', { className: 'ar-modal-head' }, React.createElement('span', { className: 'ar-modal-title' }, '写作风格记忆'), React.createElement('button', { className: 'ar-btn', type: 'button', onClick: props.onClose }, '关闭')),
+      React.createElement('div', { className: 'ar-modal-sub' }, '这些规则来自你过去的逐句批注，已进入 Agent 的系统提示；写中文内容时优先遵守。'),
+      props.rules.length === 0
+        ? React.createElement('div', { className: 'ar-empty' }, '还没有风格规则。让 Agent 按批注修改后，它会用 writing_style_add 把可复用的表达偏好记进来。')
+        : React.createElement(
+            'div',
+            { className: 'ar-rule-list' },
+            props.rules.map((rule) =>
+              React.createElement(
+                'div',
+                { key: rule.id, className: 'ar-rule' },
+                React.createElement('div', { className: 'ar-rule-text' }, rule.rule),
+                Array.isArray(rule.tags) && rule.tags.length > 0 ? React.createElement('div', { className: 'ar-rule-tags' }, rule.tags.join(' · ')) : null,
+                React.createElement('button', { className: 'ar-mini', type: 'button', onClick: () => props.onRemove(rule.id) }, '删除'),
+              ),
+            ),
+          ),
+    ),
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Style sheet
+ * ------------------------------------------------------------------ */
+
+const CSS_TEXT = `
+.ar-root {
+  display: flex; flex-direction: column; height: 100%; min-height: 0;
+  font-size: 13px; line-height: 1.68; color: inherit; position: relative;
+  --ar-brand: #4d6bfe; --ar-open: #d97706; --ar-done: #059669;
+}
+.ar-busy { cursor: progress; }
+.ar-tab-title { display: inline-flex; align-items: center; gap: 4px; }
+.ar-head { display: flex; gap: 6px; align-items: center; padding: 8px 10px; flex-wrap: wrap;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+.ar-title-btn { flex: 1 1 150px; min-width: 0; display: flex; flex-direction: column; gap: 1px;
+  text-align: left; background: transparent; color: inherit; cursor: pointer;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent); border-radius: 8px; padding: 5px 8px; }
+.ar-title-btn:hover { border-color: color-mix(in srgb, var(--ar-brand) 55%, transparent); }
+.ar-title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ar-sub { font-size: 11px; opacity: .62; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ar-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 6px 10px;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); font-size: 12px; }
+.ar-stat { opacity: .68; white-space: nowrap; }
+.ar-spacer { flex: 1 1 auto; }
+.ar-btn { appearance: none; cursor: pointer; color: inherit; font: inherit; font-size: 12px;
+  background: transparent; border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: 7px; padding: 3px 9px; line-height: 1.5; }
+.ar-btn:hover { background: color-mix(in srgb, currentColor 7%, transparent); }
+.ar-btn:disabled { opacity: .42; cursor: default; }
+.ar-btn-on { background: color-mix(in srgb, currentColor 10%, transparent); }
+.ar-btn-primary { border-color: color-mix(in srgb, var(--ar-brand) 45%, transparent);
+  background: color-mix(in srgb, var(--ar-brand) 13%, transparent); font-weight: 600; }
+.ar-btn-primary:not(:disabled):hover { background: color-mix(in srgb, var(--ar-brand) 20%, transparent); }
+.ar-btn-danger { border-color: color-mix(in srgb, #dc2626 45%, transparent); color: color-mix(in srgb, #dc2626 85%, currentColor); }
+.ar-mini { appearance: none; cursor: pointer; color: inherit; font: inherit; font-size: 11px;
+  background: transparent; border: 0; padding: 1px 5px; opacity: .62; border-radius: 5px; }
+.ar-mini:hover { opacity: 1; background: color-mix(in srgb, currentColor 8%, transparent); }
+.ar-notice { margin: 6px 10px 0; padding: 5px 9px; border-radius: 7px; font-size: 12px;
+  background: color-mix(in srgb, var(--ar-open) 12%, transparent); border: 1px solid color-mix(in srgb, var(--ar-open) 30%, transparent); }
+.ar-error { margin: 6px 10px 0; padding: 6px 9px; border-radius: 7px; font-size: 12px;
+  display: flex; gap: 8px; align-items: center; justify-content: space-between;
+  background: color-mix(in srgb, #dc2626 10%, transparent); border: 1px solid color-mix(in srgb, #dc2626 30%, transparent); }
+.ar-main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.ar-doc { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 10px 14px 32px; overscroll-behavior: contain; }
+.ar-block { margin: 0 0 0.72em; }
+.ar-p { margin: 0 0 0.72em; }
+.ar-heading { font-weight: 650; margin: 1.05em 0 0.5em; }
+.ar-h1 { font-size: 1.3em; } .ar-h2 { font-size: 1.19em; } .ar-h3 { font-size: 1.1em; }
+.ar-h4, .ar-h5, .ar-h6 { font-size: 1.02em; }
+.ar-li { display: flex; gap: 6px; margin: 0 0 0.42em; padding-left: 2px; }
+.ar-li-dot { opacity: .45; flex: 0 0 auto; }
+.ar-li-text { min-width: 0; }
+.ar-table { font-size: 12px; opacity: .88; border-left: 2px solid color-mix(in srgb, currentColor 18%, transparent); padding-left: 8px; margin: 0 0 0.6em; }
+.ar-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.55;
+  margin: 0 0 0.8em; padding: 8px 10px; white-space: pre; overflow: auto; tab-size: 2;
+  border: 1px solid color-mix(in srgb, currentColor 13%, transparent); border-radius: 8px;
+  background: color-mix(in srgb, currentColor 4%, transparent); }
+.ar-divider { display: flex; align-items: center; gap: 8px; margin: 14px 0 9px; font-size: 11px;
+  letter-spacing: .06em; opacity: .55; text-transform: uppercase; }
+.ar-divider::before, .ar-divider::after { content: ""; height: 1px; flex: 1; background: currentColor; opacity: .16; }
+.ar-s { cursor: pointer; border-radius: 3px; transition: background .12s ease; }
+.ar-s:hover { background: color-mix(in srgb, var(--ar-brand) 13%, transparent); }
+.ar-s-has[data-status="open"] { background: color-mix(in srgb, var(--ar-open) 14%, transparent);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--ar-open) 55%, transparent); }
+.ar-s-has[data-status="resolved"] { background: color-mix(in srgb, var(--ar-done) 10%, transparent);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--ar-done) 40%, transparent); }
+.ar-s-flash { outline: 2px solid color-mix(in srgb, var(--ar-brand) 65%, transparent); outline-offset: 1px; }
+.ar-s-code { display: inline; }
+.ar-mark { font-size: 9px; line-height: 1; vertical-align: super; margin-left: 1px; padding: 0 3px;
+  border-radius: 99px; border: 1px solid currentColor; opacity: .8; }
+.ar-notice, .ar-error { flex: 0 0 auto; }
+.ar-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px 10px 24px; }
+.ar-filters { display: flex; gap: 6px; margin-bottom: 8px; }
+.ar-chip { appearance: none; cursor: pointer; color: inherit; font: inherit; font-size: 11px;
+  border: 1px solid color-mix(in srgb, currentColor 16%, transparent); background: transparent;
+  border-radius: 99px; padding: 2px 10px; opacity: .72; }
+.ar-chip-on { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
+.ar-card { border: 1px solid color-mix(in srgb, currentColor 12%, transparent); border-radius: 9px;
+  padding: 8px 10px; margin-bottom: 8px; }
+.ar-card-orphan { border-style: dashed; opacity: .82; }
+.ar-card-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 11px; }
+.ar-card-loc { opacity: .7; }
+.ar-status { font-size: 10px; padding: 0 6px; border-radius: 99px; border: 1px solid currentColor; opacity: .75; }
+.ar-status-open { color: var(--ar-open); border-color: color-mix(in srgb, var(--ar-open) 45%, transparent); }
+.ar-status-resolved { color: var(--ar-done); border-color: color-mix(in srgb, var(--ar-done) 45%, transparent); }
+.ar-status-orphan { color: #dc2626; border-color: color-mix(in srgb, #dc2626 45%, transparent); }
+.ar-card-quote { margin-top: 5px; font-size: 12px; opacity: .78; padding-left: 7px;
+  border-left: 2px solid color-mix(in srgb, currentColor 18%, transparent); }
+.ar-card-comment { margin-top: 5px; font-size: 12.5px; white-space: pre-wrap; }
+.ar-card-reply { margin-top: 5px; font-size: 12px; opacity: .68; white-space: pre-wrap; }
+.ar-empty { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 28px 22px; text-align: center; font-size: 12.5px; opacity: .82; overflow: auto; }
+.ar-empty-title { font-size: 15px; font-weight: 650; opacity: .95; }
+.ar-empty-text { max-width: 330px; line-height: 1.7; }
+.ar-empty-path { font-size: 11px; opacity: .6; word-break: break-all; }
+.ar-empty-actions { margin-top: 4px; }
+.ar-tab-title { font-size: inherit; }
+.ar-overlay { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center;
+  padding: 18px; background: color-mix(in srgb, CanvasText 22%, transparent); }
+.ar-modal { width: min(430px, calc(100vw - 36px)); max-height: min(72vh, 620px); display: flex; flex-direction: column;
+  gap: 8px; padding: 12px 14px; border-radius: 12px; color: CanvasText;
+  background: var(--dsw-alias-bg-lvl-2, var(--dsw-alias-bg, Canvas));
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+  box-shadow: 0 18px 48px color-mix(in srgb, CanvasText 22%, transparent); }
+.ar-modal-head { display: flex; align-items: center; gap: 8px; }
+.ar-modal-title { font-weight: 650; flex: 1 1 auto; }
+.ar-modal-sub { font-size: 11.5px; opacity: .62; line-height: 1.55; word-break: break-all; }
+.ar-search { width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; color: inherit;
+  background: color-mix(in srgb, Canvas 80%, CanvasText 4%); border-radius: 8px; padding: 6px 9px;
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent); outline: none; }
+.ar-search:focus { border-color: color-mix(in srgb, var(--ar-brand) 55%, transparent); }
+.ar-file-list { overflow: auto; min-height: 0; display: flex; flex-direction: column; gap: 2px; padding-right: 2px; }
+.ar-file-group { font-size: 10.5px; letter-spacing: .06em; opacity: .55; padding: 8px 4px 3px; text-transform: uppercase; }
+.ar-file-row { appearance: none; cursor: pointer; color: inherit; font: inherit; text-align: left;
+  display: flex; align-items: center; gap: 8px; padding: 5px 7px; border-radius: 7px; border: 0; background: transparent; }
+.ar-file-row:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+.ar-file-ext { flex: 0 0 auto; font-size: 9.5px; opacity: .6; min-width: 28px; }
+.ar-file-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.ar-file-meta { flex: 0 0 auto; font-size: 10.5px; opacity: .5; }
+.ar-rule-list { overflow: auto; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+.ar-rule { border: 1px solid color-mix(in srgb, CanvasText 12%, transparent); border-radius: 8px; padding: 7px 9px;
+  display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+.ar-rule-text { flex: 1 1 200px; font-size: 12.5px; }
+.ar-rule-tags { font-size: 10.5px; opacity: .55; }
+.ar-pop-backdrop { position: fixed; inset: 0; z-index: 100; }
+.ar-pop { position: fixed; z-index: 110; width: 340px; max-width: calc(100vw - 24px); box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 7px; padding: 10px 11px; border-radius: 11px; color: CanvasText;
+  background: var(--dsw-alias-bg-lvl-2, var(--dsw-alias-bg, Canvas));
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+  box-shadow: 0 14px 40px color-mix(in srgb, CanvasText 24%, transparent); }
+.ar-pop-quote { font-size: 12px; opacity: .72; line-height: 1.55; max-height: 3.9em; overflow: auto;
+  border-left: 2px solid color-mix(in srgb, CanvasText 18%, transparent); padding-left: 7px; }
+.ar-pop-input { width: 100%; box-sizing: border-box; resize: vertical; min-height: 76px; max-height: 210px;
+  font: inherit; font-size: 12.5px; line-height: 1.6; color: inherit; background: color-mix(in srgb, Canvas 82%, CanvasText 4%);
+  border-radius: 8px; padding: 7px 9px; border: 1px solid color-mix(in srgb, CanvasText 16%, transparent); outline: none; }
+.ar-pop-input:focus { border-color: color-mix(in srgb, var(--ar-brand) 55%, transparent); }
+.ar-pop-actions { display: flex; gap: 6px; align-items: center; }
+.ar-pop-hint { font-size: 10.5px; opacity: .48; }
+.ar-toast { position: fixed; left: 50%; bottom: 26px; z-index: 140; transform: translate(-50%, 14px);
+  max-width: min(520px, calc(100vw - 40px)); box-sizing: border-box; padding: 8px 14px; border-radius: 9px;
+  font-size: 12.5px; line-height: 1.5; color: CanvasText; background: var(--dsw-alias-bg-lvl-2, Canvas);
+  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  box-shadow: 0 12px 32px color-mix(in srgb, CanvasText 24%, transparent);
+  opacity: 0; pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
+.ar-toast[data-show="1"] { opacity: 1; transform: translate(-50%, 0); }
+.ar-toast-warn { border-color: color-mix(in srgb, var(--ar-open, #d97706) 45%, transparent); }
+`
+
+/* ------------------------------------------------------------------ *
+ * Plugin entry
+ * ------------------------------------------------------------------ */
+
+/** Services required before the tab can register (platform baseline). */
+export const inject = ['slots']
+
+export function apply(ctx: any): void {
+  if (typeof document === 'undefined') return
+  pluginCtx = ctx
+  installStyleTag()
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['sidebarRightTabs', 'sidebarRight'], (hostCtx: any) => {
+        installTab(hostCtx)
+      })
+      return
+    } catch {
+      // Fall through to the eager path.
+    }
+  }
+  installTab(ctx)
+}
+
+/** Pure helpers exposed for the offline smoke suite (nothing in DSH reads them). */
+export const __testing = {
+  buildReviewMessage,
+  buildExportMarkdown,
+  fileAddressFor,
+  locationLabel,
+  needsSpaceBetween,
+  formatLabel,
+  clip,
+  oneLine,
+}

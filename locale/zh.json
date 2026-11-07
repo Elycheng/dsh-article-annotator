@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "文稿批注",
+    "description": "在右侧栏逐句批注 Markdown / Word / PowerPoint / PDF 文稿；Agent 通过工具读取每句意见并修改，勾选已解决，并把反复出现的表达偏好记入长期风格记忆。"
+  }
+}
