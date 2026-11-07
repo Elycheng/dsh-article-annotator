@@ -17,8 +17,8 @@ const files = readdirSync(HERE)
   .sort()
   .map((name) => join(HERE, name))
 
-const [major, minor] = process.versions.node.split('.').map((part) => Number(part))
-const supportsIsolation = major > 22 || (major === 22 && minor >= 8)
+const major = Number(process.versions.node.split('.')[0])
+const supportsIsolation = major >= 24
 
 console.log('running ' + files.length + ' test files (node ' + process.versions.node + '):')
 for (const file of files) console.log('  - ' + file.slice(HERE.length + 1))
