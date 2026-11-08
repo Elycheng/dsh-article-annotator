@@ -179,3 +179,26 @@ test('file addresses and spacing helpers follow the host grammar', async () => {
   assert.equal(exports.__testing.needsSpaceBetween('Hello', 'world'), true)
   assert.equal(exports.__testing.needsSpaceBetween('中文。', '下一句'), false)
 })
+
+test('right-click helpers resolve preview paths and selected sentences', async () => {
+  const { exports } = await loadBundle()
+  const testing = exports.__testing
+  assert.equal(
+    testing.fileFromResourceAddress('dsh-resource://file/session/session-1/docs/%E6%8A%A5%E5%91%8A.md'),
+    'docs/报告.md',
+  )
+  assert.equal(testing.fileFromResourceAddress('dsh-session://x'), null)
+  assert.equal(testing.basenameOfPath('C:\\work\\docs\\a.md'), 'a.md')
+  assert.equal(testing.normalizeForMatch(' 第一句，。 '), '第一句')
+  const article = {
+    blocks: [
+      { id: 'b0', kind: 'paragraph', text: '这是一段。', sentences: [{ id: 'b0s0', index: 0, text: '这是一段。' }] },
+      { id: 'b1', kind: 'paragraph', text: '第二段有更多字。', sentences: [{ id: 'b1s0', index: 0, text: '第二段有更多字。' }] },
+    ],
+  }
+  const exact = testing.findSentenceByQuote(article, '“这是一段。”')
+  assert.equal(exact.sentence.id, 'b0s0')
+  const partial = testing.findSentenceByQuote(article, '更多字')
+  assert.equal(partial.sentence.id, 'b1s0')
+  assert.equal(testing.findSentenceByQuote(article, '完全不存在的句子内容'), null)
+})

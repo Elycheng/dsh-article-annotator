@@ -105,12 +105,33 @@ interface EditorState {
   top: number
 }
 
+/** A request to focus one sentence after a context-menu action opens the tab. */
+interface PendingReview {
+  sessionId?: string
+  file?: string
+  basename?: string
+  quote?: string
+}
+
+/** One entry of the plugin's own right-click menu. */
+interface ContextMenuItem {
+  label: string
+  onPick: () => void
+}
+
 const TAB_ID = 'dsh-article-annotator/main'
 const TAB_KIND = 'article-annotator'
 const TAB_TITLE = '文稿批注'
 const API_BASE = '/article-annotator/api'
 
 let pluginCtx: any = null
+/** Set when a menu action wants an article opened; consumed by the mounted tab. */
+let pendingReview: PendingReview | null = null
+/** The mounted tab subscribes here so a menu action can steer an open tab. */
+let pendingReviewHandler: ((pending: PendingReview) => void | Promise<void>) | null = null
+/** The one floating context menu element (at most one exists). */
+let contextMenuNode: HTMLDivElement | null = null
+let contextMenuInstalled = false
 
 /* ------------------------------------------------------------------ *
  * Small utilities
@@ -332,6 +353,239 @@ export function downloadText(filename: string, text: string): boolean {
 }
 
 /* ------------------------------------------------------------------ *
+ * Right-click entry: native article previews + our own sentence anchors
+ * ------------------------------------------------------------------ */
+
+/** Comparison key for locating a sentence from an arbitrary text selection. */
+export function normalizeForMatch(text: string): string {
+  return String(text ?? '')
+    .replace(/[\s\u3000]+/gu, '')
+    .replace(/[，。！？；：、,.!?;:…—–\-“”‘’"'（）()《》〈〉【】\[\]{}]/gu, '')
+    .toLowerCase()
+}
+
+/** Locate the sentence that best matches a selected fragment. */
+export function findSentenceByQuote(article: Article, quote: string): { block: Block; sentence: Sentence } | null {
+  const needle = normalizeForMatch(quote)
+  if (needle === '') return null
+  let best: { block: Block; sentence: Sentence; score: number } | null = null
+  for (const block of article.blocks) {
+    for (const sentence of block.sentences) {
+      const haystack = normalizeForMatch(sentence.text)
+      if (haystack === needle) return { block, sentence }
+      let score = 0
+      if (haystack.includes(needle)) score = needle.length
+      else if (needle.includes(haystack)) score = haystack.length
+      else {
+        const head = needle.slice(0, Math.min(24, needle.length))
+        if (head.length >= 8 && haystack.includes(head)) score = head.length
+      }
+      if (score > 0 && (best === null || score > best.score)) best = { block, sentence, score }
+    }
+  }
+  return best === null ? null : { block: best.block, sentence: best.sentence }
+}
+
+/** Path carried by a `dsh-resource://file/session/<id>/<path>` address. */
+export function fileFromResourceAddress(address: string): string | null {
+  if (typeof address !== 'string' || address === '') return null
+  const match = /^dsh-resource:\/\/file\/session\/[^/]+\/(.*)$/u.exec(address)
+  if (match === null) return null
+  try {
+    return match[1].split('/').map((segment) => decodeURIComponent(segment)).join('/')
+  } catch {
+    return match[1]
+  }
+}
+
+/** Last path segment, for matching a tab title against workspace files. */
+export function basenameOfPath(path: string): string {
+  const normalized = String(path ?? '').replace(/\\/gu, '/')
+  const segments = normalized.split('/')
+  return segments[segments.length - 1] ?? ''
+}
+
+/** Title of the preview tab owning `element` (fallback when no path is in the DOM). */
+function previewTabBasename(element: Element): string | null {
+  const occurrence = element.closest('[data-sidebar-right-occurrence]')?.getAttribute('data-sidebar-right-occurrence')
+  if (occurrence === null || occurrence === undefined || occurrence === '') return null
+  const titleNode = document.querySelector('[data-dockkit-tab] [data-sidebar-right-occurrence="' + occurrence + '"]')
+  const text = titleNode === null ? '' : (titleNode.textContent ?? '').trim()
+  return /\.(?:md|markdown|txt|docx|pptx|pdf)$/iu.test(text) ? text : null
+}
+
+/**
+ * Resolve what the user right-clicked: the session, the article file and the
+ * selected text. Only native document previews qualify; everything else keeps
+ * the browser's own context menu.
+ */
+function previewInfoFromEvent(target: any): { sessionId: string | null; file: string | null; basename: string | null; quote: string } | null {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return null
+  const element: Element | null =
+    target !== null && target !== undefined && target.nodeType === 1 ? (target as Element) : (target?.parentElement ?? null)
+  if (element === null || typeof element.closest !== 'function') return null
+  const root = element.closest('[data-document-preview], [data-textpreview-state], [data-pdf-preview], [data-excel-preview]')
+  if (root === null) return null
+  const sidebar = element.closest('[data-sidebar-right-session]')
+  const sessionId = sidebar === null ? null : sidebar.getAttribute('data-sidebar-right-session')
+  let file: string | null = null
+  const urlHost = element.closest('[data-textpreview-url]')
+  const address = urlHost === null ? null : urlHost.getAttribute('data-textpreview-url')
+  if (address !== null) file = fileFromResourceAddress(address)
+  if (file === null) {
+    const label = element.closest('[data-textpreview-path]') ?? root.querySelector('[data-textpreview-path]')
+    const title = label === null ? null : label.getAttribute('title')
+    if (typeof title === 'string' && title !== '') file = title
+  }
+  const basename = file !== null ? basenameOfPath(file) : previewTabBasename(element)
+  let quote = ''
+  try {
+    quote = typeof window.getSelection === 'function' ? (window.getSelection()?.toString() ?? '').trim() : ''
+  } catch {
+    quote = ''
+  }
+  return { sessionId, file, basename, quote }
+}
+
+function closeMenuOnClick(event: any): void {
+  if (contextMenuNode !== null && !contextMenuNode.contains(event.target)) closeContextMenu()
+}
+
+function closeMenuOnKey(event: any): void {
+  if (event.key === 'Escape') closeContextMenu()
+}
+
+function closeMenuOnScroll(): void {
+  closeContextMenu()
+}
+
+/** Hide the floating context menu and detach its outside-click listeners. */
+export function closeContextMenu(): void {
+  if (contextMenuNode !== null) {
+    contextMenuNode.remove()
+    contextMenuNode = null
+  }
+  if (typeof document === 'undefined') return
+  document.removeEventListener('click', closeMenuOnClick, true)
+  document.removeEventListener('keydown', closeMenuOnKey, true)
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('scroll', closeMenuOnScroll, true)
+    window.removeEventListener('resize', closeMenuOnScroll, true)
+  }
+}
+
+/** Show one small menu at viewport coordinates. */
+export function showContextMenu(x: number, y: number, items: ContextMenuItem[]): void {
+  if (typeof document === 'undefined' || items.length === 0) return
+  closeContextMenu()
+  const node = document.createElement('div')
+  node.className = 'ar-ctx'
+  node.setAttribute('role', 'menu')
+  for (const item of items) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'ar-ctx-item'
+    button.setAttribute('role', 'menuitem')
+    button.textContent = item.label
+    button.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      closeContextMenu()
+      item.onPick()
+    })
+    node.appendChild(button)
+  }
+  document.body.appendChild(node)
+  const rect = node.getBoundingClientRect()
+  const viewportWidth = typeof window === 'undefined' ? rect.width : window.innerWidth
+  const viewportHeight = typeof window === 'undefined' ? rect.height : window.innerHeight
+  node.style.left = Math.max(6, Math.min(x, viewportWidth - rect.width - 6)) + 'px'
+  node.style.top = Math.max(6, Math.min(y, viewportHeight - rect.height - 6)) + 'px'
+  contextMenuNode = node
+  setTimeout(() => {
+    if (contextMenuNode !== node || typeof document === 'undefined') return
+    document.addEventListener('click', closeMenuOnClick, true)
+    document.addEventListener('keydown', closeMenuOnKey, true)
+    if (typeof window !== 'undefined') {
+      window.addEventListener('scroll', closeMenuOnScroll, true)
+      window.addEventListener('resize', closeMenuOnScroll, true)
+    }
+  }, 0)
+}
+
+/** Open our tab (or steer the already-open one) with a pending article focus. */
+function openReviewWith(pending: PendingReview): void {
+  if (pendingReviewHandler !== null) {
+    void pendingReviewHandler(pending)
+    return
+  }
+  pendingReview = { ...pending }
+  const service = serviceOf('sidebarRight')
+  if (service === null || typeof service.openTab !== 'function') {
+    toast('右侧栏不可用，无法打开「文稿批注」', 'warn')
+    return
+  }
+  try {
+    service.openTab(TAB_KIND)
+  } catch {
+    toast('打开「文稿批注」失败', 'warn')
+  }
+}
+
+/** Menu for a right-click inside a native document preview. */
+function handleGlobalContextMenu(event: any): void {
+  if (typeof document === 'undefined') return
+  if (contextMenuNode !== null && contextMenuNode.contains(event.target)) return
+  const info = previewInfoFromEvent(event.target)
+  if (info === null) return
+  const items: ContextMenuItem[] = []
+  const hasTarget = info.file !== null || info.basename !== null
+  // No resolved article file means this is not an article preview; keep the
+  // browser's own context menu instead of showing an empty plugin menu.
+  if (!hasTarget) return
+  if (info.quote !== '') {
+    items.push({
+      label: '用「文稿批注」批注这句',
+      onPick: () => openReviewWith({ sessionId: info.sessionId ?? undefined, file: info.file ?? undefined, basename: info.basename ?? undefined, quote: info.quote }),
+    })
+  }
+  items.push({
+    label: '在「文稿批注」中打开本篇',
+    onPick: () => openReviewWith({ sessionId: info.sessionId ?? undefined, file: info.file ?? undefined, basename: info.basename ?? undefined }),
+  })
+  event.preventDefault()
+  event.stopPropagation()
+  showContextMenu(typeof event.clientX === 'number' ? event.clientX : 12, typeof event.clientY === 'number' ? event.clientY : 12, items)
+}
+
+function installGlobalContextMenu(): void {
+  if (contextMenuInstalled || typeof document === 'undefined' || typeof document.addEventListener !== 'function') return
+  contextMenuInstalled = true
+  document.addEventListener('contextmenu', handleGlobalContextMenu, true)
+}
+
+/** One-time onboarding toast plus opening the tab, so the page is discoverable. */
+function installWelcome(hostCtx: any): void {
+  if (typeof window === 'undefined' || typeof localStorage === 'undefined') return
+  const key = 'dsh-article-annotator:welcomed-v1'
+  try {
+    if (localStorage.getItem(key) === '1') return
+    localStorage.setItem(key, '1')
+  } catch {
+    return
+  }
+  setTimeout(() => {
+    toast('「文稿批注」已就绪：右侧栏引导页 → 文稿批注；在文稿预览里选中文字后右键也能直接批注')
+    try {
+      const service = hostCtx?.sidebarRight ?? serviceOf('sidebarRight')
+      if (service !== null && service !== undefined && typeof service.openTab === 'function') service.openTab(TAB_KIND)
+    } catch {
+      // Opening the tab is best-effort; the guide entry is still there.
+    }
+  }, 2000)
+}
+
+/* ------------------------------------------------------------------ *
  * Review digest (composer message + Markdown export)
  * ------------------------------------------------------------------ */
 
@@ -449,7 +703,7 @@ function installTab(hostCtx: any): void {
                     commandId: 'article-annotator.open',
                     order: 26,
                     title: () => TAB_TITLE,
-                    description: () => '逐句批注 Markdown / Word / PowerPoint / PDF 文稿，交给 Agent 修改并沉淀写作风格',
+                    description: () => '逐句批注 Markdown / Word / PowerPoint / PDF 文稿；在文稿预览里选中文字后右键也能直接批注',
                   },
                 ],
               }),
@@ -528,6 +782,7 @@ function ReviewBody(props: any): any {
   const [editor, setEditor] = React.useState<EditorState | null>(null)
   const [saving, setSaving] = React.useState<boolean>(false)
   const [deleteArmed, setDeleteArmed] = React.useState<boolean>(false)
+  const [focusTarget, setFocusTarget] = React.useState<{ blockId: string; sentenceIndex: number } | null>(null)
   const docRef = React.useRef<HTMLDivElement | null>(null)
   const aliveRef = React.useRef<boolean>(true)
   const sessionRef = React.useRef<string>(sessionId)
@@ -542,12 +797,12 @@ function ReviewBody(props: any): any {
 
   const openFile = React.useCallback(
     async (file: string) => {
-      if (file === '') return
+      if (file === '') return null
       setBusy(true)
       setError('')
       try {
         const value = await api<any>('open', { sessionId: sessionRef.current, file })
-        if (!aliveRef.current) return
+        if (!aliveRef.current) return null
         setArticle(value.article)
         setComments(Array.isArray(value.comments) ? value.comments : [])
         setStyleRules(Array.isArray(value.styleRules) ? value.styleRules : [])
@@ -561,9 +816,11 @@ function ReviewBody(props: any): any {
         const message = [...bits, ...warnings].join('；')
         if (message !== '') setNotice(message)
         else setNotice('')
+        return value
       } catch (failure) {
-        if (!aliveRef.current) return
+        if (!aliveRef.current) return null
         setError(String((failure as any)?.message ?? failure))
+        return null
       } finally {
         if (aliveRef.current) setBusy(false)
       }
@@ -647,6 +904,90 @@ function ReviewBody(props: any): any {
     },
     [comments],
   )
+
+  /** Act on a right-click menu request: open the article and focus the sentence. */
+  const consumePendingReview = React.useCallback(
+    async (pending: PendingReview) => {
+      let file = typeof pending.file === 'string' ? pending.file : ''
+      if (file === '' && typeof pending.basename === 'string' && pending.basename !== '') {
+        try {
+          const value = await api<any>('list', { sessionId: sessionRef.current })
+          const items: FileItem[] = Array.isArray(value.items) ? value.items : []
+          const wanted = pending.basename.toLowerCase()
+          const match = items.find((item) => item.name.toLowerCase() === wanted) ?? items.find((item) => item.name.toLowerCase().endsWith(wanted))
+          if (match !== undefined) file = match.path
+        } catch {
+          // Fall through to the picker.
+        }
+      }
+      if (file === '') {
+        setPickerOpen(true)
+        toast('没识别出当前预览对应的文稿，请在列表里选择要批注的文件', 'warn')
+        return
+      }
+      const value = await openFile(file)
+      if (value === null) return
+      if (typeof pending.quote === 'string' && pending.quote.trim() !== '') {
+        const found = findSentenceByQuote(value.article, pending.quote)
+        if (found === null) {
+          toast('已打开文稿，但没定位到选中的那句，请手动点选', 'warn')
+          return
+        }
+        setFocusTarget({ blockId: found.block.id, sentenceIndex: found.sentence.index })
+      }
+    },
+    [openFile],
+  )
+
+  React.useEffect(() => {
+    const handler = (pending: PendingReview) => consumePendingReview(pending)
+    pendingReviewHandler = handler
+    if (pendingReview !== null) {
+      const queued = pendingReview
+      pendingReview = null
+      void handler(queued)
+    }
+    return () => {
+      if (pendingReviewHandler === handler) pendingReviewHandler = null
+    }
+  }, [consumePendingReview])
+
+  React.useEffect(() => {
+    if (article === null || focusTarget === null) return undefined
+    const timer = setTimeout(() => {
+      const target = focusTarget
+      setFocusTarget(null)
+      const root = docRef.current
+      const element = root === null ? null : (root.querySelector('[data-ar-sentence="' + target.blockId + 's' + target.sentenceIndex + '"]') as HTMLElement | null)
+      if (element === null) {
+        toast('这句不在当前文稿里（可能已被修改）', 'warn')
+        return
+      }
+      try {
+        element.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      } catch {
+        try {
+          element.scrollIntoView()
+        } catch {
+          // Non-browser DOM shims may not implement scrolling; the flash still marks it.
+        }
+      }
+      element.classList.add('ar-s-flash')
+      setTimeout(() => {
+        try {
+          element.classList.remove('ar-s-flash')
+        } catch {
+          // The sentence may be gone after a re-render.
+        }
+      }, 1400)
+      const block = article.blocks.find((item) => item.id === target.blockId)
+      const sentence = block?.sentences.find((item) => item.index === target.sentenceIndex)
+      if (block !== undefined && sentence !== undefined) {
+        setTimeout(() => openEditorAt({ currentTarget: element }, block, sentence), 160)
+      }
+    }, 80)
+    return () => clearTimeout(timer)
+  }, [article, focusTarget, openEditorAt])
 
   const saveEditor = React.useCallback(async () => {
     if (article === null || editor === null || saving) return
@@ -839,6 +1180,19 @@ function ReviewBody(props: any): any {
         className,
         'data-ar-sentence': sentence.id,
         'data-status': row === undefined ? undefined : row.status,
+        onContextMenu: (event: any) => {
+          event.preventDefault()
+          event.stopPropagation()
+          const existing = comments.find((item) => item.blockId === block.id && item.sentenceIndex === sentence.index)
+          const element = event.currentTarget
+          showContextMenu(typeof event.clientX === 'number' ? event.clientX : 12, typeof event.clientY === 'number' ? event.clientY : 12, [
+            {
+              label: existing === undefined ? '批注这句' : '编辑这条批注',
+              onPick: () => openEditorAt({ currentTarget: element }, block, sentence),
+            },
+            { label: '复制原句', onPick: () => copyText(sentence.text) },
+          ])
+        },
         title: row === undefined ? '点击给这句写批注' : row.comment,
         onClick: (event: any) => openEditorAt(event, block, sentence),
       },
@@ -1286,6 +1640,14 @@ const CSS_TEXT = `
   opacity: 0; pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
 .ar-toast[data-show="1"] { opacity: 1; transform: translate(-50%, 0); }
 .ar-toast-warn { border-color: color-mix(in srgb, var(--ar-open, #d97706) 45%, transparent); }
+.ar-ctx { position: fixed; z-index: 160; min-width: 178px; padding: 4px; border-radius: 9px;
+  display: flex; flex-direction: column; gap: 1px; color: CanvasText;
+  background: var(--dsw-alias-bg-lvl-2, var(--dsw-alias-bg, Canvas));
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+  box-shadow: 0 12px 32px color-mix(in srgb, CanvasText 24%, transparent); }
+.ar-ctx-item { appearance: none; cursor: pointer; color: inherit; font: inherit; font-size: 12.5px;
+  text-align: left; border: 0; background: transparent; border-radius: 6px; padding: 6px 9px; white-space: nowrap; }
+.ar-ctx-item:hover, .ar-ctx-item:focus-visible { background: color-mix(in srgb, var(--ar-brand) 14%, transparent); outline: none; }
 `
 
 /* ------------------------------------------------------------------ *
@@ -1299,10 +1661,12 @@ export function apply(ctx: any): void {
   if (typeof document === 'undefined') return
   pluginCtx = ctx
   installStyleTag()
+  installGlobalContextMenu()
   if (typeof ctx.inject === 'function') {
     try {
       ctx.inject(['sidebarRightTabs', 'sidebarRight'], (hostCtx: any) => {
         installTab(hostCtx)
+        installWelcome(hostCtx)
       })
       return
     } catch {
@@ -1310,6 +1674,7 @@ export function apply(ctx: any): void {
     }
   }
   installTab(ctx)
+  installWelcome(ctx)
 }
 
 /** Pure helpers exposed for the offline smoke suite (nothing in DSH reads them). */
@@ -1322,4 +1687,10 @@ export const __testing = {
   formatLabel,
   clip,
   oneLine,
+  normalizeForMatch,
+  findSentenceByQuote,
+  fileFromResourceAddress,
+  basenameOfPath,
+  showContextMenu,
+  closeContextMenu,
 }

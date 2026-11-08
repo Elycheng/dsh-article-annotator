@@ -10,6 +10,13 @@ Initial public release.
 
 ### Added
 
+- **Right-click entry**: select text in a native document preview and the
+  plugin's context menu offers "annotate this sentence", opening the tab and
+  focusing the matching sentence; right-clicking a sentence inside the
+  plugin's own page offers annotate / copy. Right-clicking a preview without a
+  selection offers "open this article in Article Review".
+- One-time onboarding hint that opens the tab, so the sidebar page is
+  discoverable after install.
 - Right-sidebar page **Article Review (文稿批注)**: article preview with
   sentence-level annotation anchors, a comment editor popover, a searchable /
   filterable comment list, status toggling (open / resolved), Markdown export

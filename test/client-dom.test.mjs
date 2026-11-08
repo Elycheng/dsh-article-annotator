@@ -164,6 +164,62 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
   assert.ok(marked.className.includes('ar-s-has'), 'the annotated sentence is highlighted')
   assert.equal(marked.querySelector('.ar-mark')?.textContent, '1')
 
+  // Right-clicking a sentence offers the annotation entry instead of doing nothing.
+  const rightClickTarget = container.querySelector('[data-ar-sentence="b1s1"]')
+  await act(async () => {
+    rightClickTarget.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 120, clientY: 140 }))
+  })
+  const menuItems = [...window.document.querySelectorAll('.ar-ctx-item')].map((item) => item.textContent ?? '')
+  assert.ok(menuItems.some((label) => label.includes('批注这句')), 'the sentence context menu offers 批注这句')
+  await act(async () => {
+    const annotateItem = [...window.document.querySelectorAll('.ar-ctx-item')].find((item) => (item.textContent ?? '').includes('批注这句'))
+    annotateItem.click()
+  })
+  assert.ok(container.querySelector('.ar-pop-input') !== null, 'the context-menu action opens the editor')
+  await act(async () => {
+    window.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }))
+  })
+  assert.equal(container.querySelector('.ar-pop-input'), null, 'Escape closes the editor')
+
+  // Right-clicking a selection inside a native document preview opens the article here.
+  const preview = window.document.createElement('div')
+  preview.setAttribute('data-sidebar-right-session', 'session-1')
+  const previewBody = window.document.createElement('div')
+  previewBody.setAttribute('data-document-preview', 'markdown')
+  previewBody.setAttribute('data-textpreview-state', 'text')
+  previewBody.setAttribute('data-textpreview-url', 'dsh-resource://file/session/session-1/docs/a.md')
+  const quoteSpan = window.document.createElement('span')
+  quoteSpan.textContent = '第一句。'
+  previewBody.appendChild(quoteSpan)
+  preview.appendChild(previewBody)
+  window.document.body.appendChild(preview)
+  const range = window.document.createRange()
+  range.selectNodeContents(quoteSpan)
+  const selection = window.getSelection()
+  selection.removeAllRanges()
+  selection.addRange(range)
+  await act(async () => {
+    quoteSpan.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 220 }))
+  })
+  const previewMenu = [...window.document.querySelectorAll('.ar-ctx-item')].map((item) => item.textContent ?? '')
+  assert.ok(previewMenu.some((label) => label.includes('批注这句')), 'the preview context menu offers annotation')
+  await act(async () => {
+    const item = [...window.document.querySelectorAll('.ar-ctx-item')].find((entry) => (entry.textContent ?? '').includes('批注这句'))
+    item.click()
+    await new Promise((done) => setTimeout(done, 140))
+  })
+  // The focus effect schedules its own short timers after the article renders.
+  await act(async () => {
+    await new Promise((done) => setTimeout(done, 360))
+  })
+  const focusedEditor = container.querySelector('.ar-pop-input')
+
+  assert.ok(focusedEditor !== null, 'the pending quote opens the sentence editor')
+  await act(async () => {
+    window.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }))
+  })
+  preview.remove()
+  selection.removeAllRanges()
   // Click the second sentence, write a comment, save it.
   const target = container.querySelector('[data-ar-sentence="b1s1"]')
   await act(async () => {
@@ -186,8 +242,6 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
     await new Promise((done) => setTimeout(done, 120))
   })
   if (!calls.some((call) => call.url.endsWith('/comment'))) {
-    console.error('DEBUG calls:', calls.map((call) => call.url + ' ' + JSON.stringify(call.payload)).join('\n'))
-    console.error('DEBUG popover:', container.querySelector('.ar-pop')?.textContent, '| toast:', window.document.getElementById('ar-toast')?.textContent)
   }
   const commentCall = calls.find((call) => call.url.endsWith('/comment'))
   assert.ok(commentCall !== undefined, 'saving calls the comment API')
@@ -207,3 +261,4 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
   delete globalThis.document
   delete globalThis.IS_REACT_ACT_ENVIRONMENT
 })
+

@@ -2,11 +2,11 @@
 
 本文件记录 `dsh-article-annotator` 在 **DSH 0.2.0-rc.2** 上的实测证据。所有涉及个人目录、令牌、机器名、备份路径的内容均已移除或替换为占位符。
 
-## 1. 离线测试（37 项，0 失败）
+## 1. 离线测试（38 项，0 失败）
 
 ```text
 node test/run-all.mjs
-ℹ tests 37  ℹ pass 37  ℹ fail 0  ℹ skipped 0
+ℹ tests 38  ℹ pass 38  ℹ fail 0  ℹ skipped 0
 ```
 
 覆盖：
@@ -16,8 +16,8 @@ node test/run-all.mjs
 - `store.test.mjs`：批注增删改、文本重锚定与 orphan、风格规则去重、修订稿落到源文件旁且不改原文件、最近文件去重。
 - `api.test.mjs`：同源围栏（403）、缺围栏（503）、方法/参数校验、list/open/comment/style/recent 全流程。
 - `plugin.test.mjs`：Standard Schema 默认值、apply 接线（route + prompt section）、风格段落渲染与截断、无服务宿主下的降级。
-- `client.test.mjs`：客户端 bundle 以 `window.__ModuleLoader__.load` 注册、右侧栏页类型/正文/标题三个座位注册、消息与 Markdown 导出、文件地址语法。
-- `client-dom.test.mjs`：jsdom + 真实 React 18 渲染整个页面——自动打开最近文稿、句子锚点与批注角标、点击句子弹出编辑器、输入并保存后角标与计数即时更新。
+- `client.test.mjs`：客户端 bundle 以 `window.__ModuleLoader__.load` 注册、右侧栏页类型/正文/标题三个座位注册、消息与 Markdown 导出、文件地址语法、右键定位用的资源路径解析与句子匹配。
+- `client-dom.test.mjs`：jsdom + 真实 React 18 渲染整个页面——自动打开最近文稿、句子锚点与批注角标、句子右键菜单、原生预览选区右键打开并定位到对应句、输入并保存后角标与计数即时更新。
 
 ## 2. 真实 DSH web 实例（scratch profile，DSH 0.2.0-rc.2）
 
