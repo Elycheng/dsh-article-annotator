@@ -31,6 +31,14 @@ All notable changes to this project are documented here. The format follows
 - Existing sentence-only annotation files are migrated to the range model when
   loaded, so upgrading loses no comments.
 
+### Fixed
+
+- When the browser half is newer than the host half (for example after a
+  local update with only a page refresh), the tab now detects it through the
+  `probe` feature flag and explains that DSH Desktop must be restarted,
+  instead of surfacing the legacy store's "missing blockId / sentenceIndex"
+  error on save.
+
 ## [0.1.0] - 2026-11-07
 
 Initial public release.

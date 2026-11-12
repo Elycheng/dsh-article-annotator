@@ -1,4 +1,4 @@
-/** Same-origin API: fence, list/open, comments, style, validation. */
+﻿/** Same-origin API: fence, list/open, comments, style, validation. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp } from 'node:fs/promises'
@@ -183,4 +183,5 @@ test('dispatch is exported for direct in-process use', async () => {
   const ctx = fakeCtx({ cwd: FIXTURES })
   const value = await dispatch(ctx, CAPS, 'probe', {})
   assert.equal(value.version, 1)
+  assert.equal(value.features.rangeAnchors, true)
 })

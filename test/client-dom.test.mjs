@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Real-DOM render test of the browser half.
  *
  * Loads the built bundle in a jsdom window with real React from this package's
@@ -64,6 +64,8 @@ function fetchStub(calls) {
       }
     } else if (String(url).endsWith('/open')) {
       value = { cwd: 'C:/example', file: 'a.md', article: ARTICLE, comments: EXISTING, styleRules: [], orphaned: 0, reanchored: 0 }
+    } else if (String(url).endsWith('/probe')) {
+      value = { version: 1, features: { rangeAnchors: true, agentTools: true } }
     } else if (String(url).endsWith('/comment')) {
       value = {
         action: 'save',
@@ -177,6 +179,7 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
   const text = container.textContent ?? ''
   assert.match(text, /测试文稿/u, 'article title should render after the auto-open')
   assert.match(text, /待处理 1/u, 'the open comment count should be visible')
+  assert.equal(container.querySelector('.ar-host-outdated'), null, 'a current host does not show the outdated banner')
   assert.ok((container.querySelectorAll('[data-ar-sentence]') ?? []).length >= 3, 'every sentence is an anchor')
   const markedSentence = container.querySelector('[data-ar-sentence="b1s0"]')
   assert.ok(markedSentence.querySelector('.ar-seg-has') !== null, 'the annotated sentence is highlighted')

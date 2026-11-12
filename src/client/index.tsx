@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-article-annotator — browser half.
  *
  * Registered as a page type in DSH's native right sidebar (`sidebarRightTabs`)
@@ -954,6 +954,7 @@ function ReviewBody(props: any): any {
   const [deleteArmed, setDeleteArmed] = React.useState<boolean>(false)
   const [focusRange, setFocusRange] = React.useState<PendingFocus | null>(null)
   const [selectionBubble, setSelectionBubble] = React.useState<{ anchor: RangeAnchor; left: number; top: number } | null>(null)
+  const [hostOutdated, setHostOutdated] = React.useState<boolean>(false)
   const docRef = React.useRef<HTMLDivElement | null>(null)
   const aliveRef = React.useRef<boolean>(true)
   const sessionRef = React.useRef<string>(sessionId)
@@ -963,6 +964,27 @@ function ReviewBody(props: any): any {
     aliveRef.current = true
     return () => {
       aliveRef.current = false
+    }
+  }, [])
+
+  // The browser half is hot-reloadable but the host half is not: after an
+  // update the page may talk to an older store that only accepts sentence
+  // anchors. Detect that up front so the user sees an actionable banner
+  // instead of a bare "missing blockId / sentenceIndex" error on save.
+  React.useEffect(() => {
+    let cancelled = false
+    void api<any>('probe', {})
+      .then((value) => {
+        if (cancelled) return
+        if (value?.features?.rangeAnchors === true) return
+        setHostOutdated(true)
+        setNotice('宿主插件还是旧版本：请完全退出并重新启动 DSH Desktop（只刷新页面不够），再使用任意范围批注。')
+      })
+      .catch(() => {
+        // Very old hosts may not answer probe; the normal error path still works.
+      })
+    return () => {
+      cancelled = true
     }
   }, [])
 
@@ -1242,7 +1264,14 @@ function ReviewBody(props: any): any {
       setEditor(null)
       toast(editor.commentId === undefined ? '批注已保存' : '批注已更新')
     } catch (failure) {
-      toast(String((failure as any)?.message ?? failure), 'warn')
+      const message = String((failure as any)?.message ?? failure)
+      // Old host stores reject the range payload with the v1 sentence error.
+      if (/sentenceIndex|缺少定位信息/u.test(message) && !/quote/u.test(message)) {
+        setHostOutdated(true)
+        toast('DSH 宿主插件还是旧版本：请完全退出并重新启动 DSH Desktop 后再批注（刷新页面不会更新宿主半）', 'warn')
+      } else {
+        toast(message, 'warn')
+      }
     } finally {
       if (aliveRef.current) setSaving(false)
     }
@@ -1618,6 +1647,13 @@ function ReviewBody(props: any): any {
           React.createElement('button', { className: 'ar-btn', type: 'button', onClick: exportMarkdown }, '导出批注'),
         ),
     notice === '' ? null : React.createElement('div', { className: 'ar-notice' }, notice),
+    hostOutdated
+      ? React.createElement(
+          'div',
+          { className: 'ar-error ar-host-outdated' },
+          '宿主插件仍是旧版本：请完全退出 DSH Desktop（包括托盘里的后台进程）再重新打开，刷新页面只能更新界面、不能更新宿主半；否则保存批注会失败。',
+        )
+      : null,
     error === '' ? null : React.createElement('div', { className: 'ar-error' }, error, React.createElement('button', { className: 'ar-btn', type: 'button', onClick: () => void loadList(true) }, '重试')),
     // ── body ────────────────────────────────────────────────────────
     React.createElement(
@@ -1630,7 +1666,7 @@ function ReviewBody(props: any): any {
               'div',
               { className: 'ar-empty' },
               React.createElement('div', { className: 'ar-empty-title' }, '给文稿逐句批注'),
-              React.createElement('div', { className: 'ar-empty-text' }, '选一篇 Markdown / Word / PowerPoint / PDF 文稿，点任意一句话写意见；写完点「发给 Agent 修改」，Agent 会读到每条意见、改稿、勾掉批注，并把反复出现的表达偏好记进写作风格记忆。'),
+              React.createElement('div', { className: 'ar-empty-text' }, '选一篇 Markdown / Word / PowerPoint / PDF 文稿：点整句批注，或拖选任意文字/词组后点浮出的「批注选中文字」；写完点「发给 Agent 修改」，Agent 会读到每条意见、改稿、勾掉批注，并把反复出现的表达偏好记进写作风格记忆。'),
               React.createElement('div', { className: 'ar-empty-actions' }, React.createElement('button', { className: 'ar-btn ar-btn-primary', type: 'button', onClick: () => setPickerOpen(true) }, '选择文稿')),
               cwd === '' ? null : React.createElement('div', { className: 'ar-empty-path' }, '工作目录：' + cwd),
             )

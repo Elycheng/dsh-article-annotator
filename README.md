@@ -73,6 +73,12 @@ node scripts/uninstall-local.mjs --profile-dir "$HOME/.dsh/profiles/web"
 2. 在 profile 目录执行 `pnpm install --ignore-scripts`；
 3. 重启 DSH 或等待 HMR。
 
+### 更新插件后：客户端热更新，宿主半要重启
+
+- 界面（client 半）会随页面刷新/热更新；
+- 存储、重锚定、Agent 工具这些宿主半代码**不会**随页面刷新更新。更新本地插件后请右键系统托盘的 DSH Desktop 图标 →「重启 DSH Desktop」→「重启应用」。
+- 如果跳过这步，保存任意范围批注时页面会提示「宿主插件仍是旧版本」（旧宿主只认整句锚点），而不是成功保存。
+
 ## 用法
 
 1. 刷新页面，打开右侧栏；点侧栏的「+」/ 引导页里的 **「文稿批注」**（首次安装后页面会提示并自动打开一次）。
