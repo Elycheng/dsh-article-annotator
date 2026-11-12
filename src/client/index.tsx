@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh-article-annotator — browser half.
  *
  * Registered as a page type in DSH's native right sidebar (`sidebarRightTabs`)
@@ -28,6 +28,8 @@ interface Sentence {
   id: string
   index: number
   text: string
+  start?: number
+  end?: number
 }
 
 interface Block {
@@ -43,8 +45,11 @@ interface Block {
 interface CommentRow {
   id: string
   blockId: string
-  sentenceIndex: number
-  sentence: string
+  start?: number
+  end?: number
+  quote?: string
+  sentence?: string
+  sentenceIndex?: number
   comment: string
   status: CommentStatus
   createdAt?: number
@@ -94,8 +99,9 @@ interface RecentItem {
 
 interface EditorState {
   blockId: string
-  sentenceIndex: number
-  sentence: string
+  start: number
+  end: number
+  quote: string
   blockKind: string
   page?: number
   slide?: number
@@ -103,6 +109,25 @@ interface EditorState {
   text: string
   left: number
   top: number
+}
+
+/** A resolved text range inside one block, used by click / selection / jump. */
+interface RangeAnchor {
+  block: Block
+  start: number
+  end: number
+  quote: string
+}
+
+/** A pending focus request consumed by the mounted tab. */
+interface PendingFocus {
+  blockId: string
+  start: number
+  end: number
+  quote: string
+  blockKind: string
+  page?: number
+  slide?: number
 }
 
 /** A request to focus one sentence after a context-menu action opens the tab. */
@@ -386,6 +411,151 @@ export function findSentenceByQuote(article: Article, quote: string): { block: B
   return best === null ? null : { block: best.block, sentence: best.sentence }
 }
 
+/** Text covered by a comment, tolerating records from the sentence-only schema. */
+export function commentQuote(row: CommentRow | null | undefined): string {
+  if (row === null || row === undefined) return ''
+  return String(row.quote ?? row.sentence ?? '')
+}
+
+/** Character range of a comment, or null for a legacy record not yet anchored. */
+export function commentRange(row: CommentRow | null | undefined): { start: number; end: number } | null {
+  if (row === null || row === undefined) return null
+  const start = Number(row.start)
+  const end = Number(row.end)
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) return null
+  return { start, end }
+}
+
+/** Sentence containing a block offset (whole-sentence fallback). */
+export function sentenceAtOffset(block: Block, offset: number): Sentence | null {
+  let fallback: Sentence | null = block.sentences[0] ?? null
+  for (const sentence of block.sentences) {
+    const start = Number.isInteger(sentence.start) ? Number(sentence.start) : block.text.indexOf(sentence.text)
+    const end = Number.isInteger(sentence.end) ? Number(sentence.end) : start + sentence.text.length
+    if (start >= 0 && offset >= start && offset < end) return sentence
+  }
+  return fallback
+}
+
+/** Normalised text plus a map back to original character offsets. */
+export function normalizedWithMap(text: string, loose: boolean): { normalized: string; map: number[] } {
+  const punctuation = new Set('。；;，,、！!？?…：:.—–-“”‘’""\'\'（）()《》〈〉【】[]{}'.split(''))
+  let normalized = ''
+  const map: number[] = []
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (char === undefined) continue
+    if (/\s/u.test(char) || char === '\u3000') continue
+    if (loose && punctuation.has(char)) continue
+    normalized += char
+    map.push(index)
+  }
+  return { normalized, map }
+}
+
+/**
+ * Locate a quote inside one block text: raw substring first, then ignoring
+ * whitespace, then also ignoring punctuation. Mirrors the host re-anchoring.
+ */
+export function locateQuoteRange(block: Block, quote: string): { start: number; end: number } | null {
+  const text = block.text
+  const needle = String(quote ?? '')
+  if (needle === '') return null
+  const exact = text.indexOf(needle)
+  if (exact >= 0) return { start: exact, end: exact + needle.length }
+  for (const loose of [false, true]) {
+    const haystack = normalizedWithMap(text, loose)
+    const target = normalizedWithMap(needle, loose)
+    if (target.normalized === '') continue
+    const at = haystack.normalized.indexOf(target.normalized)
+    if (at < 0) continue
+    const start = haystack.map[at]
+    const last = haystack.map[at + target.normalized.length - 1]
+    if (start === undefined || last === undefined) continue
+    return { start, end: last + 1 }
+  }
+  return null
+}
+
+/** Locate a selected quote in the article, returning a block-relative range. */
+export function findRangeByQuote(article: Article, quote: string): RangeAnchor | null {
+  const needle = String(quote ?? '').trim()
+  if (needle === '') return null
+  for (const block of article.blocks) {
+    const found = locateQuoteRange(block, needle)
+    if (found !== null) return { block, start: found.start, end: found.end, quote: block.text.slice(found.start, found.end) }
+  }
+  const match = findSentenceByQuote(article, needle)
+  if (match === null) return null
+  const start = Number.isInteger(match.sentence.start) ? Number(match.sentence.start) : match.block.text.indexOf(match.sentence.text)
+  if (start < 0) return null
+  return { block: match.block, start, end: start + match.sentence.text.length, quote: match.sentence.text }
+}
+
+/** Map a DOM point inside a rendered segment to a block character offset. */
+function selectionPointInfo(root: HTMLElement, node: Node, offset: number): { blockId: string; offset: number; segment: HTMLElement } | null {
+  let element: Element | null = node.nodeType === 1 ? (node as Element) : node.parentElement
+  while (element !== null && element !== root) {
+    if (element.hasAttribute('data-ar-block') && element.hasAttribute('data-ar-region-start')) break
+    element = element.parentElement
+  }
+  if (element === null || element === root) return null
+  const blockId = element.getAttribute('data-ar-block') ?? ''
+  const start = Number(element.getAttribute('data-ar-region-start'))
+  if (blockId === '' || !Number.isFinite(start)) return null
+  let length = 0
+  if (node !== element) {
+    const range = document.createRange()
+    try {
+      range.setStart(element, 0)
+      range.setEnd(node, offset)
+      length = range.toString().length
+    } catch {
+      return null
+    }
+  }
+  return { blockId, offset: start + length, segment: element as HTMLElement }
+}
+
+/**
+ * Resolve the current text selection to a block range inside the reviewed
+ * article. Cross-block selections are refused (one comment anchors one block).
+ */
+export function rangeFromSelection(article: Article, doc: HTMLElement | null): RangeAnchor | null {
+  if (typeof window === 'undefined' || doc === null) return null
+  const selection = typeof window.getSelection === 'function' ? window.getSelection() : null
+  if (selection === null || selection === undefined || selection.rangeCount === 0 || selection.isCollapsed) return null
+  const text = selection.toString().trim()
+  if (text === '') return null
+  const domRange = selection.getRangeAt(0)
+  if (!doc.contains(domRange.startContainer) || !doc.contains(domRange.endContainer)) return null
+  const startPoint = selectionPointInfo(doc, domRange.startContainer, domRange.startOffset)
+  const endPoint = selectionPointInfo(doc, domRange.endContainer, domRange.endOffset)
+  if (startPoint === null || endPoint === null || startPoint.blockId !== endPoint.blockId) return null
+  const block = article.blocks.find((item) => item.id === startPoint.blockId)
+  if (block === undefined) return null
+  const start = Math.min(startPoint.offset, endPoint.offset)
+  const end = Math.max(startPoint.offset, endPoint.offset)
+  if (end <= start || end > block.text.length) return null
+  const quote = block.text.slice(start, end).trim()
+  if (quote === '') return null
+  const trimmedStart = start + (block.text.slice(start, end).length - block.text.slice(start, end).trimStart().length)
+  return { block, start: trimmedStart, end: trimmedStart + quote.length, quote }
+}
+
+/** Find the rendered segment containing a block offset (scroll / focus helper). */
+export function findSegmentElement(doc: HTMLElement | null, blockId: string, offset: number): HTMLElement | null {
+  if (doc === null) return null
+  const nodes = doc.querySelectorAll('[data-ar-block]')
+  for (const node of Array.from(nodes)) {
+    if (node.getAttribute('data-ar-block') !== blockId) continue
+    const start = Number(node.getAttribute('data-ar-region-start'))
+    const end = Number(node.getAttribute('data-ar-region-end'))
+    if (Number.isFinite(start) && Number.isFinite(end) && offset >= start && offset < end) return node as HTMLElement
+  }
+  return null
+}
+
 /** Path carried by a `dsh-resource://file/session/<id>/<path>` address. */
 export function fileFromResourceAddress(address: string): string | null {
   if (typeof address !== 'string' || address === '') return null
@@ -545,7 +715,7 @@ function handleGlobalContextMenu(event: any): void {
   if (!hasTarget) return
   if (info.quote !== '') {
     items.push({
-      label: '用「文稿批注」批注这句',
+      label: '用「文稿批注」批注选中的文字',
       onPick: () => openReviewWith({ sessionId: info.sessionId ?? undefined, file: info.file ?? undefined, basename: info.basename ?? undefined, quote: info.quote }),
     })
   }
@@ -602,7 +772,7 @@ export function buildReviewMessage(article: Article, openComments: CommentRow[],
   lines.push('')
   openComments.forEach((row, index) => {
     lines.push(index + 1 + '. ' + locationLabel(article, row.blockId) + '（批注 id: ' + row.id + '）')
-    lines.push('   原句：' + clip(oneLine(row.sentence), 160))
+    lines.push('   选中片段：' + clip(oneLine(commentQuote(row)), 160))
     lines.push('   意见：' + oneLine(row.comment))
   })
   lines.push('')
@@ -637,7 +807,7 @@ export function buildExportMarkdown(article: Article, comments: CommentRow[]): s
     }
     for (const row of rows) {
       lines.push('- **' + locationLabel(article, row.blockId) + '**' + (row.orphaned === true ? '（定位失效）' : '') + ' · `' + row.id + '`')
-      lines.push('  - 原句：' + oneLine(row.sentence))
+      lines.push('  - 选中片段：' + oneLine(commentQuote(row)))
       lines.push('  - 批注：' + oneLine(row.comment))
       if (typeof row.agentReply === 'string' && row.agentReply !== '') lines.push('  - Agent：' + oneLine(row.agentReply))
     }
@@ -782,7 +952,8 @@ function ReviewBody(props: any): any {
   const [editor, setEditor] = React.useState<EditorState | null>(null)
   const [saving, setSaving] = React.useState<boolean>(false)
   const [deleteArmed, setDeleteArmed] = React.useState<boolean>(false)
-  const [focusTarget, setFocusTarget] = React.useState<{ blockId: string; sentenceIndex: number } | null>(null)
+  const [focusRange, setFocusRange] = React.useState<PendingFocus | null>(null)
+  const [selectionBubble, setSelectionBubble] = React.useState<{ anchor: RangeAnchor; left: number; top: number } | null>(null)
   const docRef = React.useRef<HTMLDivElement | null>(null)
   const aliveRef = React.useRef<boolean>(true)
   const sessionRef = React.useRef<string>(sessionId)
@@ -880,9 +1051,9 @@ function ReviewBody(props: any): any {
   }, [article, openFile])
 
   const openEditorAt = React.useCallback(
-    (event: any, block: Block, sentence: Sentence) => {
-      const existing = comments.find((row) => row.blockId === block.id && row.sentenceIndex === sentence.index)
-      const rect = event?.currentTarget?.getBoundingClientRect?.()
+    (event: any, block: Block, start: number, end: number, quote: string) => {
+      const existing = comments.find((row) => row.blockId === block.id && Number(row.start) === start && Number(row.end) === end)
+      const rect = event?.currentTarget?.getBoundingClientRect?.() ?? event?.rect
       const width = 340
       const viewportWidth = typeof window === 'undefined' ? 800 : window.innerWidth
       const viewportHeight = typeof window === 'undefined' ? 800 : window.innerHeight
@@ -890,8 +1061,9 @@ function ReviewBody(props: any): any {
       const top = Math.min(Math.max(64, (rect?.bottom ?? 120) + 6), Math.max(64, viewportHeight - 250))
       setEditor({
         blockId: block.id,
-        sentenceIndex: sentence.index,
-        sentence: sentence.text,
+        start,
+        end,
+        quote,
         blockKind: block.kind,
         page: block.page,
         slide: block.slide,
@@ -901,11 +1073,50 @@ function ReviewBody(props: any): any {
         top,
       })
       setDeleteArmed(false)
+      setSelectionBubble(null)
     },
     [comments],
   )
 
-  /** Act on a right-click menu request: open the article and focus the sentence. */
+  const hideSelectionBubble = React.useCallback(() => setSelectionBubble(null), [])
+
+  /** Turn the current text selection inside the article into a bubble. */
+  const inspectSelection = React.useCallback(() => {
+    if (article === null) return
+    const anchor = rangeFromSelection(article, docRef.current)
+    if (anchor === null) {
+      setSelectionBubble(null)
+      return
+    }
+    let left = 16
+    let top = 160
+    try {
+      const selection = typeof window.getSelection === 'function' ? window.getSelection() : null
+      if (selection !== null && selection.rangeCount > 0) {
+        const rect = selection.getRangeAt(0).getBoundingClientRect()
+        if (Number.isFinite(rect.left) && Number.isFinite(rect.bottom)) {
+          left = rect.left
+          top = rect.bottom + 8
+        }
+      }
+    } catch {
+      // Keep the default position.
+    }
+    setSelectionBubble({ anchor, left: Math.max(8, left), top: Math.max(40, top) })
+  }, [article])
+
+  React.useEffect(() => {
+    if (selectionBubble === null) return undefined
+    const onPointerDown = (event: any) => {
+      const target = event?.target
+      const inside = target !== null && target !== undefined && typeof target.closest === 'function' ? target.closest('.ar-sel-bubble') !== null : false
+      if (!inside) setSelectionBubble(null)
+    }
+    document.addEventListener('mousedown', onPointerDown, true)
+    return () => document.removeEventListener('mousedown', onPointerDown, true)
+  }, [selectionBubble])
+
+  /** Act on a right-click menu request: open the article and focus the range. */
   const consumePendingReview = React.useCallback(
     async (pending: PendingReview) => {
       let file = typeof pending.file === 'string' ? pending.file : ''
@@ -928,12 +1139,20 @@ function ReviewBody(props: any): any {
       const value = await openFile(file)
       if (value === null) return
       if (typeof pending.quote === 'string' && pending.quote.trim() !== '') {
-        const found = findSentenceByQuote(value.article, pending.quote)
+        const found = findRangeByQuote(value.article, pending.quote)
         if (found === null) {
-          toast('已打开文稿，但没定位到选中的那句，请手动点选', 'warn')
+          toast('已打开文稿，但没定位到选中的文字，请手动点选', 'warn')
           return
         }
-        setFocusTarget({ blockId: found.block.id, sentenceIndex: found.sentence.index })
+        setFocusRange({
+          blockId: found.block.id,
+          start: found.start,
+          end: found.end,
+          quote: found.quote,
+          blockKind: found.block.kind,
+          page: found.block.page,
+          slide: found.block.slide,
+        })
       }
     },
     [openFile],
@@ -953,14 +1172,14 @@ function ReviewBody(props: any): any {
   }, [consumePendingReview])
 
   React.useEffect(() => {
-    if (article === null || focusTarget === null) return undefined
+    if (article === null || focusRange === null) return undefined
     const timer = setTimeout(() => {
-      const target = focusTarget
-      setFocusTarget(null)
+      const target = focusRange
+      setFocusRange(null)
       const root = docRef.current
-      const element = root === null ? null : (root.querySelector('[data-ar-sentence="' + target.blockId + 's' + target.sentenceIndex + '"]') as HTMLElement | null)
+      const element = findSegmentElement(root, target.blockId, target.start)
       if (element === null) {
-        toast('这句不在当前文稿里（可能已被修改）', 'warn')
+        toast('选中的那段文字不在当前文稿里（可能已被修改）', 'warn')
         return
       }
       try {
@@ -972,22 +1191,21 @@ function ReviewBody(props: any): any {
           // Non-browser DOM shims may not implement scrolling; the flash still marks it.
         }
       }
-      element.classList.add('ar-s-flash')
+      element.classList.add('ar-seg-flash')
       setTimeout(() => {
         try {
-          element.classList.remove('ar-s-flash')
+          element.classList.remove('ar-seg-flash')
         } catch {
-          // The sentence may be gone after a re-render.
+          // The segment may be gone after a re-render.
         }
       }, 1400)
       const block = article.blocks.find((item) => item.id === target.blockId)
-      const sentence = block?.sentences.find((item) => item.index === target.sentenceIndex)
-      if (block !== undefined && sentence !== undefined) {
-        setTimeout(() => openEditorAt({ currentTarget: element }, block, sentence), 160)
+      if (block !== undefined) {
+        setTimeout(() => openEditorAt({ currentTarget: element }, block, target.start, target.end, target.quote), 160)
       }
     }, 80)
     return () => clearTimeout(timer)
-  }, [article, focusTarget, openEditorAt])
+  }, [article, focusRange, openEditorAt])
 
   const saveEditor = React.useCallback(async () => {
     if (article === null || editor === null || saving) return
@@ -1004,8 +1222,9 @@ function ReviewBody(props: any): any {
         action: 'save',
         ...(editor.commentId === undefined ? {} : { id: editor.commentId }),
         blockId: editor.blockId,
-        sentenceIndex: editor.sentenceIndex,
-        sentence: editor.sentence,
+        start: editor.start,
+        end: editor.end,
+        quote: editor.quote,
         comment: text,
         blockKind: editor.blockKind,
         ...(editor.page === undefined ? {} : { page: editor.page }),
@@ -1076,26 +1295,33 @@ function ReviewBody(props: any): any {
 
   const jumpToComment = React.useCallback((row: CommentRow) => {
     if (row.orphaned === true) {
-      toast('这句原文已经改动，无法定位', 'warn')
+      toast('这段原文已经改动，无法定位', 'warn')
       return
     }
-    const sentenceId = row.blockId + 's' + row.sentenceIndex
+    const range = commentRange(row)
     const root = docRef.current
-    if (root === null || typeof root.querySelector !== 'function') return
-    const element = root.querySelector('[data-ar-sentence="' + sentenceId + '"]') as HTMLElement | null
+    if (root === null || range === null) {
+      toast('这段原文不在当前视图中（可能已被删除）', 'warn')
+      return
+    }
+    const element = findSegmentElement(root, row.blockId, range.start)
     if (element === null) {
-      toast('这句不在当前视图中（可能已被删除）', 'warn')
+      toast('这段原文不在当前视图中（可能已被删除）', 'warn')
       return
     }
     try {
       element.scrollIntoView({ block: 'center', behavior: 'smooth' })
     } catch {
-      element.scrollIntoView()
+      try {
+        element.scrollIntoView()
+      } catch {
+        // Non-browser DOM shims may not implement scrolling.
+      }
     }
-    element.classList.add('ar-s-flash')
+    element.classList.add('ar-seg-flash')
     setTimeout(() => {
       try {
-        element.classList.remove('ar-s-flash')
+        element.classList.remove('ar-seg-flash')
       } catch {
         // Element may be gone.
       }
@@ -1138,67 +1364,168 @@ function ReviewBody(props: any): any {
   const resolvedCount = comments.length - openCount
   const visibleComments = filter === 'open' ? comments.filter((row) => row.status === 'open') : comments
 
-  const commentBySentence = React.useMemo(() => {
-    const map = new Map<string, CommentRow>()
-    for (const row of comments) map.set(row.blockId + ':' + row.sentenceIndex, row)
+  const commentsByBlock = React.useMemo(() => {
+    const map = new Map<string, CommentRow[]>()
+    for (const row of comments) {
+      if (row.orphaned === true) continue
+      if (commentRange(row) === null) continue
+      const list = map.get(row.blockId) ?? []
+      list.push(row)
+      map.set(row.blockId, list)
+    }
+    for (const list of map.values()) list.sort((a, b) => Number(a.start) - Number(b.start))
     return map
   }, [comments])
 
   const numberById = React.useMemo(() => {
     const order: CommentRow[] = []
-    const seen = new Set<string>()
     if (article !== null) {
-      for (const block of article.blocks) {
-        for (const sentence of block.sentences) {
-          const row = commentBySentence.get(block.id + ':' + sentence.index)
-          if (row !== undefined && !seen.has(row.id)) {
-            order.push(row)
-            seen.add(row.id)
-          }
-        }
-      }
-    }
-    for (const row of comments) {
-      if (!seen.has(row.id)) {
-        order.push(row)
-        seen.add(row.id)
-      }
+      const blockOrder = new Map(article.blocks.map((block, index) => [block.id, index]))
+      order.push(
+        ...comments
+          .filter((row) => row.orphaned !== true && commentRange(row) !== null)
+          .slice()
+          .sort((a, b) => {
+            const blockA = blockOrder.get(a.blockId) ?? Number.MAX_SAFE_INTEGER
+            const blockB = blockOrder.get(b.blockId) ?? Number.MAX_SAFE_INTEGER
+            if (blockA !== blockB) return blockA - blockB
+            return Number(a.start) - Number(b.start)
+          }),
+      )
     }
     const map = new Map<string, number>()
     order.forEach((row, index) => map.set(row.id, index + 1))
     return map
-  }, [article, comments, commentBySentence])
+  }, [article, comments])
+
+  /** Split one sentence into segments at comment-range boundaries. */
+  const sentenceSegments = (block: Block, sentence: Sentence) => {
+    const sentenceStart = Number.isInteger(sentence.start) ? Number(sentence.start) : block.text.indexOf(sentence.text)
+    const sentenceEnd = Number.isInteger(sentence.end) ? Number(sentence.end) : sentenceStart + sentence.text.length
+    const rows = (commentsByBlock.get(block.id) ?? []).filter((row) => {
+      const range = commentRange(row)
+      return range !== null && range.start < sentenceEnd && range.end > sentenceStart
+    })
+    const boundaries = new Set<number>([sentenceStart, sentenceEnd])
+    for (const row of rows) {
+      const range = commentRange(row)
+      if (range === null) continue
+      if (range.start > sentenceStart && range.start < sentenceEnd) boundaries.add(range.start)
+      if (range.end > sentenceStart && range.end < sentenceEnd) boundaries.add(range.end)
+    }
+    const sorted = [...boundaries].sort((a, b) => a - b)
+    const segments: Array<{ start: number; end: number; text: string; covers: CommentRow[] }> = []
+    for (let index = 0; index < sorted.length - 1; index += 1) {
+      const start = sorted[index]
+      const end = sorted[index + 1]
+      if (start === undefined || end === undefined || end <= start) continue
+      segments.push({
+        start,
+        end,
+        text: block.text.slice(start, end),
+        covers: rows.filter((row) => {
+          const range = commentRange(row)
+          return range !== null && range.start < end && range.end > start
+        }),
+      })
+    }
+    return { sentenceStart, sentenceEnd, segments }
+  }
+
+  /** The most specific comment covering a segment (shortest range wins). */
+  const primaryComment = (covers: CommentRow[]): CommentRow | null => {
+    if (covers.length === 0) return null
+    const sorted = [...covers].sort((a, b) => {
+      const rangeA = commentRange(a)
+      const rangeB = commentRange(b)
+      const lengthA = rangeA === null ? Number.MAX_SAFE_INTEGER : rangeA.end - rangeA.start
+      const lengthB = rangeB === null ? Number.MAX_SAFE_INTEGER : rangeB.end - rangeB.start
+      if (lengthA !== lengthB) return lengthA - lengthB
+      return Number(a.start) - Number(b.start)
+    })
+    return sorted[0] ?? null
+  }
 
   const renderSentence = (block: Block, sentence: Sentence, previous: Sentence | null) => {
-    const row = commentBySentence.get(block.id + ':' + sentence.index)
-    const number = row === undefined ? undefined : numberById.get(row.id)
-    const className = 'ar-s' + (row === undefined ? '' : ' ar-s-has') + (block.kind === 'code' ? ' ar-s-code' : '')
+    const { sentenceStart, sentenceEnd, segments } = sentenceSegments(block, sentence)
+    const sentenceText = block.text.slice(sentenceStart, sentenceEnd)
+    const children: any[] = []
+    if (previous !== null && needsSpaceBetween(previous.text, sentenceText)) children.push(' ')
+    for (const segment of segments) {
+      const primary = primaryComment(segment.covers)
+      const classes = 'ar-seg' + (primary === null ? '' : ' ar-seg-has') + (block.kind === 'code' ? ' ar-seg-code' : '')
+      children.push(
+        React.createElement(
+          'span',
+          {
+            key: segment.start + '-' + segment.end,
+            className: classes,
+            'data-ar-block': block.id,
+            'data-ar-region-start': segment.start,
+            'data-ar-region-end': segment.end,
+            'data-ar-cids': segment.covers.map((row) => row.id).join(','),
+            'data-status': primary === null ? undefined : primary.status,
+            title: primary === null ? '点击给这句写批注；也可以选中任意文字后右键批注' : primary.comment,
+            onClick: (event: any) => {
+              event.stopPropagation()
+              if (primary !== null) {
+                const range = commentRange(primary)
+                if (range !== null) {
+                  openEditorAt(event, block, range.start, range.end, commentQuote(primary))
+                  return
+                }
+              }
+              openEditorAt(event, block, sentenceStart, sentenceEnd, sentenceText)
+            },
+          },
+          segment.text,
+        ),
+      )
+      for (const row of segment.covers) {
+        const range = commentRange(row)
+        if (range !== null && range.end === segment.end) {
+          children.push(
+            React.createElement('sup', { key: 'mark-' + row.id, className: 'ar-mark', 'data-ar-mark': row.id }, String(numberById.get(row.id) ?? '•')),
+          )
+        }
+      }
+    }
     return React.createElement(
       'span',
       {
         key: sentence.id,
-        className,
+        className: 'ar-s' + (block.kind === 'code' ? ' ar-s-code' : ''),
         'data-ar-sentence': sentence.id,
-        'data-status': row === undefined ? undefined : row.status,
         onContextMenu: (event: any) => {
           event.preventDefault()
           event.stopPropagation()
-          const existing = comments.find((item) => item.blockId === block.id && item.sentenceIndex === sentence.index)
+          const selectionAnchor = article === null ? null : rangeFromSelection(article, docRef.current)
+          if (selectionAnchor !== null) {
+            const element = event.currentTarget
+            showContextMenu(typeof event.clientX === 'number' ? event.clientX : 12, typeof event.clientY === 'number' ? event.clientY : 12, [
+              {
+                label: '批注选中的文字',
+                onPick: () => openEditorAt({ currentTarget: element }, selectionAnchor.block, selectionAnchor.start, selectionAnchor.end, selectionAnchor.quote),
+              },
+              { label: '复制选中的文字', onPick: () => copyText(selectionAnchor.quote) },
+            ])
+            return
+          }
+          const existing = (commentsByBlock.get(block.id) ?? []).find((row) => {
+            const range = commentRange(row)
+            return range !== null && range.start === sentenceStart && range.end === sentenceEnd
+          })
           const element = event.currentTarget
           showContextMenu(typeof event.clientX === 'number' ? event.clientX : 12, typeof event.clientY === 'number' ? event.clientY : 12, [
             {
               label: existing === undefined ? '批注这句' : '编辑这条批注',
-              onPick: () => openEditorAt({ currentTarget: element }, block, sentence),
+              onPick: () => openEditorAt({ currentTarget: element }, block, sentenceStart, sentenceEnd, sentenceText),
             },
-            { label: '复制原句', onPick: () => copyText(sentence.text) },
+            { label: '复制原句', onPick: () => copyText(sentenceText) },
           ])
         },
-        title: row === undefined ? '点击给这句写批注' : row.comment,
-        onClick: (event: any) => openEditorAt(event, block, sentence),
       },
-      previous !== null && needsSpaceBetween(previous.text, sentence.text) ? ' ' : null,
-      sentence.text,
-      row === undefined ? null : React.createElement('sup', { className: 'ar-mark' }, String(number ?? '•')),
+      children,
     )
   }
 
@@ -1333,15 +1660,49 @@ function ReviewBody(props: any): any {
                           React.createElement('button', { className: 'ar-mini', type: 'button', onClick: () => jumpToComment(row) }, '定位'),
                           React.createElement('button', { className: 'ar-mini', type: 'button', onClick: () => void toggleStatus(row) }, row.status === 'open' ? '解决' : '重开'),
                         ),
-                        React.createElement('div', { className: 'ar-card-quote' }, clip(oneLine(row.sentence), 160)),
+                        React.createElement('div', { className: 'ar-card-quote' }, clip(oneLine(commentQuote(row)), 160)),
                         React.createElement('div', { className: 'ar-card-comment' }, row.comment),
                         typeof row.agentReply === 'string' && row.agentReply !== '' ? React.createElement('div', { className: 'ar-card-reply' }, 'Agent：' + clip(oneLine(row.agentReply), 240)) : null,
                       ),
                     ),
               )
-            : React.createElement('div', { className: 'ar-doc', ref: docRef }, renderDoc()),
+            : React.createElement(
+                'div',
+                {
+                  className: 'ar-doc',
+                  ref: docRef,
+                  onMouseUp: () => {
+                    setTimeout(inspectSelection, 0)
+                  },
+                  onKeyUp: (event: any) => {
+                    if (event.key === 'Shift' || event.shiftKey) setTimeout(inspectSelection, 0)
+                  },
+                  onScroll: hideSelectionBubble,
+                },
+                renderDoc(),
+              ),
     ),
     // ── overlays ────────────────────────────────────────────────────
+    selectionBubble === null
+      ? null
+      : React.createElement(
+          'div',
+          { className: 'ar-sel-bubble', style: { left: selectionBubble.left + 'px', top: selectionBubble.top + 'px' } },
+          React.createElement(
+            'button',
+            {
+              className: 'ar-btn ar-btn-primary',
+              type: 'button',
+              onMouseDown: (event: any) => event.preventDefault(),
+              onClick: () => {
+                const bubble = selectionBubble
+                setSelectionBubble(null)
+                openEditorAt({ rect: { left: bubble.left, bottom: bubble.top - 8 } }, bubble.anchor.block, bubble.anchor.start, bubble.anchor.end, bubble.anchor.quote)
+              },
+            },
+            '批注选中文字',
+          ),
+        ),
     pickerOpen ? React.createElement(FilePicker, { cwd, files, recent, onClose: () => setPickerOpen(false), onPick: (file: string) => void openFile(file) }) : null,
     styleOpen
       ? React.createElement(StylePanel, {
@@ -1359,11 +1720,11 @@ function ReviewBody(props: any): any {
           React.createElement(
             'div',
             { className: 'ar-pop', style: { left: editor.left + 'px', top: editor.top + 'px' } },
-            React.createElement('div', { className: 'ar-pop-quote' }, clip(oneLine(editor.sentence), 200)),
+            React.createElement('div', { className: 'ar-pop-quote' }, clip(oneLine(editor.quote), 200)),
             React.createElement('textarea', {
               className: 'ar-pop-input',
               value: editor.text,
-              placeholder: '写对这句话的意见…',
+              placeholder: '写对选中文字的意见…',
               rows: 4,
               autoFocus: true,
               onChange: (event: any) => setEditor({ ...editor, text: event.target.value }),
@@ -1554,14 +1915,20 @@ const CSS_TEXT = `
 .ar-divider { display: flex; align-items: center; gap: 8px; margin: 14px 0 9px; font-size: 11px;
   letter-spacing: .06em; opacity: .55; text-transform: uppercase; }
 .ar-divider::before, .ar-divider::after { content: ""; height: 1px; flex: 1; background: currentColor; opacity: .16; }
-.ar-s { cursor: pointer; border-radius: 3px; transition: background .12s ease; }
-.ar-s:hover { background: color-mix(in srgb, var(--ar-brand) 13%, transparent); }
-.ar-s-has[data-status="open"] { background: color-mix(in srgb, var(--ar-open) 14%, transparent);
+.ar-s { border-radius: 3px; }
+.ar-seg { cursor: pointer; border-radius: 3px; transition: background .12s ease; }
+.ar-seg:hover { background: color-mix(in srgb, var(--ar-brand) 13%, transparent); }
+.ar-seg-has[data-status="open"] { background: color-mix(in srgb, var(--ar-open) 16%, transparent);
   box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--ar-open) 55%, transparent); }
-.ar-s-has[data-status="resolved"] { background: color-mix(in srgb, var(--ar-done) 10%, transparent);
+.ar-seg-has[data-status="resolved"] { background: color-mix(in srgb, var(--ar-done) 11%, transparent);
   box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--ar-done) 40%, transparent); }
-.ar-s-flash { outline: 2px solid color-mix(in srgb, var(--ar-brand) 65%, transparent); outline-offset: 1px; }
-.ar-s-code { display: inline; }
+.ar-seg-flash { outline: 2px solid color-mix(in srgb, var(--ar-brand) 65%, transparent); outline-offset: 1px; }
+.ar-seg-code { display: inline; }
+.ar-sel-bubble { position: fixed; z-index: 150; transform: translate(-50%, 0); display: flex; gap: 4px; padding: 3px;
+  border-radius: 9px; color: CanvasText; background: var(--dsw-alias-bg-lvl-2, var(--dsw-alias-bg, Canvas));
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+  box-shadow: 0 10px 26px color-mix(in srgb, CanvasText 22%, transparent); }
+.ar-sel-bubble .ar-btn { font-size: 11.5px; padding: 3px 9px; }
 .ar-mark { font-size: 9px; line-height: 1; vertical-align: super; margin-left: 1px; padding: 0 3px;
   border-radius: 99px; border: 1px solid currentColor; opacity: .8; }
 .ar-notice, .ar-error { flex: 0 0 auto; }
@@ -1693,4 +2060,12 @@ export const __testing = {
   basenameOfPath,
   showContextMenu,
   closeContextMenu,
+  commentQuote,
+  commentRange,
+  sentenceAtOffset,
+  normalizedWithMap,
+  locateQuoteRange,
+  findRangeByQuote,
+  rangeFromSelection,
+  findSegmentElement,
 }

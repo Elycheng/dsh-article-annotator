@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-12
+
+### Added
+
+- **Arbitrary-range annotation**: a comment now covers any selected text — a
+  whole sentence, a phrase, or just a few words — instead of only a complete
+  sentence. Select text in the article view and use the floating
+  "批注选中文字" button, or right-click the selection.
+- Right-clicking a selection inside a native document preview now annotates
+  the exact selected text (the tab opens focused on that range).
+- The comment list shows the covered fragment, and the agent-facing
+  `article_review` tool returns `quote` (the covered text) instead of the old
+  whole-sentence `sentence` field.
+
+### Changed
+
+- Annotation records now anchor `{ blockId, start, end, quote }` character
+  ranges over the block text; overlapping comments in one sentence stay
+  independently addressable and clickable.
+- Text selection resolution tolerates the platform's rendered segments and
+  refuses cross-paragraph selections with a clear hint.
+- Re-anchoring first validates the stored offsets, then falls back to text
+  matching that ignores whitespace and punctuation differences, and finally to
+  the legacy sentence index; unmatched comments are still kept as orphaned.
+- Existing sentence-only annotation files are migrated to the range model when
+  loaded, so upgrading loses no comments.
+
 ## [0.1.0] - 2026-11-07
 
 Initial public release.

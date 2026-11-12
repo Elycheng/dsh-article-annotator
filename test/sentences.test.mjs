@@ -35,4 +35,7 @@ test('sentence ids are stable and offset into the block', () => {
   const sentences = sentencesFor('b7', '第一句。第二句。')
   assert.deepEqual(sentences.map((item) => item.id), ['b7s0', 'b7s1'])
   assert.equal(sentences[1].index, 1)
+  assert.deepEqual([sentences[0].start, sentences[0].end], [0, 4])
+  assert.deepEqual([sentences[1].start, sentences[1].end], [4, 8])
+  assert.equal('第一句。第二句。'.slice(sentences[1].start, sentences[1].end), '第二句。')
 })

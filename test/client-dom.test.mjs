@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Real-DOM render test of the browser half.
  *
  * Loads the built bundle in a jsdom window with real React from this package's
@@ -32,14 +32,22 @@ const ARTICLE = {
   format: 'markdown',
   title: '测试文稿',
   blocks: [
-    { id: 'b0', kind: 'heading', text: '测试文稿', sentences: [{ id: 'b0s0', index: 0, text: '测试文稿' }] },
-    { id: 'b1', kind: 'paragraph', text: '第一句。第二句。', sentences: [{ id: 'b1s0', index: 0, text: '第一句。' }, { id: 'b1s1', index: 1, text: '第二句。' }] },
+    { id: 'b0', kind: 'heading', text: '测试文稿', sentences: [{ id: 'b0s0', index: 0, text: '测试文稿', start: 0, end: 4 }] },
+    {
+      id: 'b1',
+      kind: 'paragraph',
+      text: '第一句。第二句。',
+      sentences: [
+        { id: 'b1s0', index: 0, text: '第一句。', start: 0, end: 4 },
+        { id: 'b1s1', index: 1, text: '第二句。', start: 4, end: 8 },
+      ],
+    },
   ],
   stats: { blocks: 2, sentences: 3, chars: 20, bytes: 128 },
   warnings: [],
 }
 
-const EXISTING = [{ id: 'c1', blockId: 'b1', sentenceIndex: 0, sentence: '第一句。', comment: '太生硬', status: 'open', createdAt: 1, updatedAt: 1 }]
+const EXISTING = [{ id: 'c1', blockId: 'b1', start: 0, end: 4, quote: '第一句。', comment: '太生硬', status: 'open', createdAt: 1, updatedAt: 1 }]
 
 /** Build the fetch stub: list -> recent article -> open -> comment save. */
 function fetchStub(calls) {
@@ -59,7 +67,17 @@ function fetchStub(calls) {
     } else if (String(url).endsWith('/comment')) {
       value = {
         action: 'save',
-        comment: { id: 'c2', blockId: 'b1', sentenceIndex: 1, sentence: '第二句。', comment: payload.comment, status: 'open', createdAt: 2, updatedAt: 2 },
+        comment: {
+          id: payload.id ?? 'c' + (calls.filter((call) => call.url.endsWith('/comment')).length + 1),
+          blockId: payload.blockId,
+          start: payload.start,
+          end: payload.end,
+          quote: payload.quote,
+          comment: payload.comment,
+          status: 'open',
+          createdAt: 2,
+          updatedAt: 2,
+        },
         total: 2,
       }
     } else {
@@ -160,9 +178,9 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
   assert.match(text, /测试文稿/u, 'article title should render after the auto-open')
   assert.match(text, /待处理 1/u, 'the open comment count should be visible')
   assert.ok((container.querySelectorAll('[data-ar-sentence]') ?? []).length >= 3, 'every sentence is an anchor')
-  const marked = container.querySelector('[data-ar-sentence="b1s0"]')
-  assert.ok(marked.className.includes('ar-s-has'), 'the annotated sentence is highlighted')
-  assert.equal(marked.querySelector('.ar-mark')?.textContent, '1')
+  const markedSentence = container.querySelector('[data-ar-sentence="b1s0"]')
+  assert.ok(markedSentence.querySelector('.ar-seg-has') !== null, 'the annotated sentence is highlighted')
+  assert.equal(markedSentence.querySelector('.ar-mark')?.textContent, '1')
 
   // Right-clicking a sentence offers the annotation entry instead of doing nothing.
   const rightClickTarget = container.querySelector('[data-ar-sentence="b1s1"]')
@@ -202,9 +220,9 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
     quoteSpan.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 220 }))
   })
   const previewMenu = [...window.document.querySelectorAll('.ar-ctx-item')].map((item) => item.textContent ?? '')
-  assert.ok(previewMenu.some((label) => label.includes('批注这句')), 'the preview context menu offers annotation')
+  assert.ok(previewMenu.some((label) => label.includes('批注选中的文字')), 'the preview context menu offers selection annotation')
   await act(async () => {
-    const item = [...window.document.querySelectorAll('.ar-ctx-item')].find((entry) => (entry.textContent ?? '').includes('批注这句'))
+    const item = [...window.document.querySelectorAll('.ar-ctx-item')].find((entry) => (entry.textContent ?? '').includes('批注选中的文字'))
     item.click()
     await new Promise((done) => setTimeout(done, 140))
   })
@@ -213,15 +231,58 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
     await new Promise((done) => setTimeout(done, 360))
   })
   const focusedEditor = container.querySelector('.ar-pop-input')
-
-  assert.ok(focusedEditor !== null, 'the pending quote opens the sentence editor')
+  assert.ok(focusedEditor !== null, 'the pending quote opens the range editor')
   await act(async () => {
     window.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }))
   })
   preview.remove()
   selection.removeAllRanges()
-  // Click the second sentence, write a comment, save it.
-  const target = container.querySelector('[data-ar-sentence="b1s1"]')
+
+  // ── annotate an arbitrary word selection (not a whole sentence) ──
+  const doc = container.querySelector('.ar-doc')
+  assert.ok(doc !== null)
+  const headingSegment = container.querySelector('[data-ar-sentence="b0s0"] .ar-seg')
+  assert.ok(headingSegment !== null)
+  const headingTextNode = headingSegment.firstChild
+  assert.ok(headingTextNode !== null && headingTextNode.nodeType === 3)
+  const wordRange = window.document.createRange()
+  wordRange.setStart(headingTextNode, 1)
+  wordRange.setEnd(headingTextNode, 3)
+  const wordSelection = window.getSelection()
+  wordSelection.removeAllRanges()
+  wordSelection.addRange(wordRange)
+  await act(async () => {
+    doc.dispatchEvent(new window.MouseEvent('mouseup', { bubbles: true }))
+    await new Promise((done) => setTimeout(done, 60))
+  })
+  const bubble = container.querySelector('.ar-sel-bubble')
+  assert.ok(bubble !== null, 'selecting text shows the annotation bubble')
+  await act(async () => {
+    const bubbleButton = bubble.querySelector('button')
+    bubbleButton.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+    bubbleButton.click()
+  })
+  const wordEditor = container.querySelector('.ar-pop-input')
+  assert.ok(wordEditor !== null, 'the bubble opens the editor for the selected words')
+  await act(async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')
+    descriptor.set.call(wordEditor, '标题也可以更短')
+    wordEditor.dispatchEvent(new window.Event('input', { bubbles: true }))
+    const save = [...container.querySelectorAll('.ar-pop-actions button')].find((button) => (button.textContent ?? '').includes('保存'))
+    save.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+    await new Promise((done) => setTimeout(done, 120))
+  })
+  const wordCall = calls.find((call) => call.url.endsWith('/comment') && call.payload.quote === '试文')
+  assert.ok(wordCall !== undefined, 'saving a word-level selection calls the comment API')
+  assert.equal(wordCall.payload.start, 1)
+  assert.equal(wordCall.payload.end, 3)
+  assert.equal(wordCall.payload.comment, '标题也可以更短')
+  const wordSegment = container.querySelector('[data-ar-region-start="1"][data-ar-region-end="3"]')
+  assert.ok(wordSegment !== null && wordSegment.className.includes('ar-seg-has'), 'the selected words are highlighted')
+
+  // Click the second sentence, write a comment covering the whole sentence, save it.
+  const target = container.querySelector('[data-ar-sentence="b1s1"] .ar-seg')
+  assert.ok(target !== null)
   await act(async () => {
     target.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
   })
@@ -241,17 +302,15 @@ test('client tab renders the article, then annotates a sentence end-to-end', { s
     saveButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
     await new Promise((done) => setTimeout(done, 120))
   })
-  if (!calls.some((call) => call.url.endsWith('/comment'))) {
-  }
-  const commentCall = calls.find((call) => call.url.endsWith('/comment'))
-  assert.ok(commentCall !== undefined, 'saving calls the comment API')
+  const commentCall = calls.find((call) => call.url.endsWith('/comment') && call.payload.quote === '第二句。')
+  assert.ok(commentCall !== undefined, 'saving a sentence calls the comment API')
   assert.equal(commentCall.payload.comment, '太啰嗦')
-  assert.equal(commentCall.payload.sentence, '第二句。')
+  assert.deepEqual([commentCall.payload.start, commentCall.payload.end], [4, 8])
   const second = container.querySelector('[data-ar-sentence="b1s1"]')
-  assert.ok(second.className.includes('ar-s-has'), 'the new comment is reflected immediately')
-  assert.equal(second.querySelector('.ar-mark')?.textContent, '2')
+  assert.ok(second.querySelector('.ar-seg-has') !== null, 'the new sentence comment is reflected immediately')
+  assert.ok(second.querySelectorAll('.ar-mark').length >= 1)
   assert.equal(container.querySelector('.ar-pop-input'), null, 'the editor closes after save')
-  assert.match(container.textContent ?? '', /待处理 2/u)
+  assert.match(container.textContent ?? '', /待处理 3/u)
 
   await act(async () => {
     root.unmount()

@@ -1,4 +1,4 @@
-# 发布与市场收录
+﻿# 发布与市场收录
 
 给维护者的发布清单。所有命令在仓库根目录执行。
 
@@ -61,7 +61,7 @@ DSH 生态有两个常见入口，发布 npm 后都可收录：
 建议条目文案（按对方 README 的实际列格式微调）：
 
 ```markdown
-- [dsh-article-annotator](https://github.com/Elycheng/dsh-article-annotator) — 右侧栏逐句批注 Markdown/DOCX/PPTX/PDF，Agent 读取批注改稿并把反复出现的表达偏好记入长期风格记忆。`dsh plugin add dsh-article-annotator`
+- [dsh-article-annotator](https://github.com/Elycheng/dsh-article-annotator) — 右侧栏按任意选中文字批注 Markdown/DOCX/PPTX/PDF，Agent 读取批注改稿并把反复出现的表达偏好记入长期风格记忆。`dsh plugin add dsh-article-annotator`
 ```
 
 ### 3.2 DSH Community Market / 其他目录

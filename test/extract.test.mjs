@@ -29,6 +29,13 @@ test('markdown: title, heading/list/code blocks and CJK-aware paragraphs', async
   // Inline syntax is stripped, words survive.
   assert.ok(!article.blocks.some((block) => block.text.includes('**')))
   assert.ok(article.blocks.some((block) => block.kind === 'list' && block.text.startsWith('第一条列表项')))
+  // Every sentence carries block-text offsets so arbitrary selections can be
+  // anchored on the same scale.
+  for (const block of article.blocks) {
+    for (const sentence of block.sentences) {
+      assert.equal(block.text.slice(sentence.start, sentence.end), sentence.text)
+    }
+  }
 })
 
 test('markdown: long text renders with block anchors for the agent', async () => {

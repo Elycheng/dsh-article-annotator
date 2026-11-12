@@ -1,7 +1,7 @@
 {
   "name": "dsh-article-annotator",
-  "version": "0.1.0",
-  "description": "Sentence-level annotations for Markdown / Word / PowerPoint / PDF articles in DSH's right sidebar, with an agent review loop and a long-term writing-style memory.",
+  "version": "0.2.0",
+  "description": "Text-range annotations (sentence, phrase or any selected words) for Markdown / Word / PowerPoint / PDF articles in DSH's right sidebar, with an agent review loop and a long-term writing-style memory.",
   "type": "module",
   "license": "MIT",
   "main": "lib/index.js",
@@ -49,7 +49,8 @@
     "docx",
     "pptx",
     "pdf",
-    "writing-style"
+    "writing-style",
+    "selection"
   ],
   "repository": {
     "type": "git",

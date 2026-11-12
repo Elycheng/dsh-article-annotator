@@ -126,8 +126,9 @@ test('open extracts, records recents and returns anchored comments', async () =>
     file: 'sample.md',
     action: 'save',
     blockId: 'b1',
-    sentenceIndex: 0,
-    sentence: open.json.value.article.blocks[1].sentences[0].text,
+    start: open.json.value.article.blocks[1].sentences[0].start,
+    end: open.json.value.article.blocks[1].sentences[0].end,
+    quote: open.json.value.article.blocks[1].sentences[0].text,
     comment: '这句太像总结陈词',
   })
   assert.equal(saved.status, 200)
@@ -135,6 +136,9 @@ test('open extracts, records recents and returns anchored comments', async () =>
   const reopened = await call(ctx, 'open', { sessionId: 's1', file: 'sample.md' })
   assert.equal(reopened.json.value.comments.length, 1)
   assert.equal(reopened.json.value.comments[0].comment, '这句太像总结陈词')
+  assert.equal(reopened.json.value.comments[0].quote, open.json.value.article.blocks[1].sentences[0].text)
+  assert.equal(typeof reopened.json.value.comments[0].start, 'number')
+  assert.equal(typeof reopened.json.value.comments[0].end, 'number')
   assert.equal(reopened.json.value.article.comments.length, 1)
   const patched = await call(ctx, 'comment', {
     sessionId: 's1',
